@@ -1215,17 +1215,6 @@ export class Paginator extends HTMLElement {
     nextSection() {
         return this.goTo({ index: this.#adjacentIndex(1) })
     }
-    getAdjacentIndex(dir) {
-        return this.#adjacentIndex(dir)
-    }
-    async preloadSection(index) {
-        if (!this.#canGoToIndex(index)) return null
-        const section = this.sections[index]
-        if (!section) return null
-        const src = await section.load()
-        const data = await section.loadContent?.()
-        return { index, src, data }
-    }
     firstSection() {
         const index = this.sections.findIndex(section => section.linear !== 'no')
         return this.goTo({ index })
