@@ -1097,6 +1097,8 @@ export class Paginator extends HTMLElement {
     }
     async #display(promise) {
         const { index, src, data, anchor, onLoad, select } = await promise
+        // Guard: if section load failed (catch returned {}), keep current view
+        if (index === undefined) return
         this.#index = index
         const hasFocus = this.#view?.document?.hasFocus()
         if (src) {
