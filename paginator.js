@@ -1782,6 +1782,12 @@ export class Paginator extends HTMLElement {
         this.#stabilizing = true
         this.#container.style.opacity = '0'
         const { index, src, data, anchor, onLoad, select } = await promise
+        // Guard: if section load failed (catch returned {}), keep current view
+        if (index === undefined) {
+            this.#stabilizing = false
+            this.#container.style.opacity = ''
+            return
+        }
         this.#primaryIndex = index
         const hasFocus = this.#primaryView?.document?.hasFocus()
         if (src) {
