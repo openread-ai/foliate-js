@@ -265,6 +265,23 @@ export const makePDF = async file => {
             cache.set(i, url)
             return url
         },
+        createDocument: async () => {
+            const page = await pdf.getPage(i + 1)
+            const textContent = await page.getTextContent()
+            const doc = document.implementation.createHTMLDocument('')
+            let para = doc.createElement('p')
+            doc.body.appendChild(para)
+            for (const item of textContent.items) {
+                if ('str' in item && item.str) {
+                    para.appendChild(doc.createTextNode(item.str + ' '))
+                }
+                if (item.hasEOL) {
+                    para = doc.createElement('p')
+                    doc.body.appendChild(para)
+                }
+            }
+            return doc
+        },
         size: 1000,
     }))
     book.isExternal = uri => /^\w+:/i.test(uri)
