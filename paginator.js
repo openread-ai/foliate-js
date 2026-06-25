@@ -1778,6 +1778,31 @@ export class Paginator extends HTMLElement {
         if (!this.scrolled) this.#replaceBackground()
         this.dispatchEvent(new CustomEvent('relocate', { detail }))
     }
+    async #ensureScrolledStartupFill() {
+        if (this.noPreload || this.noContinuousScroll || this.#filling) return
+        const { size } = this
+        if (!size) return
+
+        this.#filling = true
+        try {
+            const maxSections = 8
+            let iterations = 0
+            while (this.#views.size < maxSections && iterations < maxSections) {
+                iterations++
+                if (this.#renderedViewSize > size + 2) break
+                const sorted = this.#sortedViews
+                const lastIndex = sorted[sorted.length - 1]?.[0]
+                if (lastIndex == null) break
+                const nextIdx = this.#adjacentIndex(1, lastIndex)
+                if (nextIdx == null) break
+                await this.#loadAdjacentSection(nextIdx)
+                if (!this.#views.has(nextIdx)) break
+                await new Promise(r => requestAnimationFrame(r))
+            }
+        } finally {
+            this.#filling = false
+        }
+    }
     async #display(promise) {
         this.#stabilizing = true
         this.#container.style.opacity = '0'
@@ -1831,6 +1856,7 @@ export class Paginator extends HTMLElement {
                 }
             }
         }
+        if (this.scrolled) await this.#ensureScrolledStartupFill()
         const resolvedAnchor = (typeof anchor === 'function'
             ? anchor(primaryView.document) : anchor) ?? 0
         await this.scrollToAnchor(resolvedAnchor, select)
