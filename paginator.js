@@ -105,38 +105,46 @@ const makeRange = (doc, node, start, end = start) => {
 
 // use binary search to find an offset value in a text node
 const bisectNode = (doc, node, cb, start = 0, end = node.nodeValue.length) => {
-    if (end - start === 1) {
-        const result = cb(makeRange(doc, node, start), makeRange(doc, node, end))
-        return result < 0 ? start : end
+    while (end - start > 1) {
+        const mid = Math.floor(start + (end - start) / 2)
+        const result = cb(makeRange(doc, node, start, mid), makeRange(doc, node, mid, end))
+        if (result < 0) end = mid
+        else if (result > 0) start = mid
+        else return mid
     }
-    const mid = Math.floor(start + (end - start) / 2)
-    const result = cb(makeRange(doc, node, start, mid), makeRange(doc, node, mid, end))
-    return result < 0 ? bisectNode(doc, node, cb, start, mid)
-        : result > 0 ? bisectNode(doc, node, cb, mid, end) : mid
+    const result = cb(makeRange(doc, node, start), makeRange(doc, node, end))
+    return result < 0 ? start : end
 }
 
 const { SHOW_ELEMENT, SHOW_TEXT, SHOW_CDATA_SECTION,
     FILTER_ACCEPT, FILTER_REJECT, FILTER_SKIP } = NodeFilter
 
-const filter = SHOW_ELEMENT | SHOW_TEXT | SHOW_CDATA_SECTION
-
-// needed cause there seems to be a bug in `getBoundingClientRect()` in Firefox
-// where it fails to include rects that have zero width and non-zero height
-// (CSSOM spec says "rectangles [...] of which the height or width is not zero")
-// which makes the visible range include an extra space at column boundaries
-const getBoundingClientRect = target => {
-    let top = Infinity, right = -Infinity, left = Infinity, bottom = -Infinity
-    for (const rect of target.getClientRects()) {
-        left = Math.min(left, rect.left)
-        top = Math.min(top, rect.top)
-        right = Math.max(right, rect.right)
-        bottom = Math.max(bottom, rect.bottom)
-    }
-    return new DOMRect(left, top, right - left, bottom - top)
+const visibleRangeTraversalDefaults = {
+    maxDepth: 512,
+    maxNodes: 50_000,
 }
 
-const getVisibleRange = (doc, start, end, mapRect) => {
-    // first get all visible nodes
+const getChildNodes = node => Array.from(node.childNodes ?? [])
+
+const nodeIsVisibleRangeCandidate = node =>
+    node.nodeType === 1 || node.nodeType === 3 || node.nodeType === 4
+
+const reportVisibleRangeTraversalLimit = detail => {
+    console.warn('[foliate-js] visible range traversal limit reached', detail)
+}
+
+const getVisibleRangeNodes = (doc, start, end, mapRect, options = {}) => {
+    const maxDepth = options.maxDepth ?? visibleRangeTraversalDefaults.maxDepth
+    const maxNodes = options.maxNodes ?? visibleRangeTraversalDefaults.maxNodes
+    const seen = new WeakSet()
+    const nodes = []
+    const stack = getChildNodes(doc.body).reverse().map(node => ({ node, depth: 1 }))
+    let visitedNodes = 0
+    let maxDepthVisited = 0
+    let depthLimitReached = false
+    let nodeLimitReached = false
+    let cycleSkipped = 0
+
     const acceptNode = node => {
         const name = node.localName?.toLowerCase()
         // ignore all scripts, styles, and their children
@@ -165,10 +173,76 @@ const getVisibleRange = (doc, start, end, mapRect) => {
         }
         return FILTER_SKIP
     }
-    const walker = doc.createTreeWalker(doc.body, filter, { acceptNode })
-    const nodes = []
-    for (let node = walker.nextNode(); node; node = walker.nextNode())
-        nodes.push(node)
+
+    while (stack.length) {
+        if (visitedNodes >= maxNodes) {
+            nodeLimitReached = true
+            break
+        }
+
+        const { node, depth } = stack.pop()
+        if (seen.has(node)) {
+            cycleSkipped++
+            continue
+        }
+        seen.add(node)
+        visitedNodes++
+        maxDepthVisited = Math.max(maxDepthVisited, depth)
+
+        if (depth > maxDepth) {
+            depthLimitReached = true
+            continue
+        }
+
+        if (!nodeIsVisibleRangeCandidate(node)) {
+            const children = getChildNodes(node)
+            for (let i = children.length - 1; i >= 0; i--)
+                stack.push({ node: children[i], depth: depth + 1 })
+            continue
+        }
+
+        const result = acceptNode(node)
+        if (result === FILTER_ACCEPT) nodes.push(node)
+        if (result === FILTER_REJECT) continue
+
+        const children = getChildNodes(node)
+        for (let i = children.length - 1; i >= 0; i--)
+            stack.push({ node: children[i], depth: depth + 1 })
+    }
+
+    if (depthLimitReached || nodeLimitReached) {
+        reportVisibleRangeTraversalLimit({
+            reason: nodeLimitReached ? 'max-nodes' : 'max-depth',
+            maxDepth,
+            maxNodes,
+            visitedNodes,
+            maxDepthVisited,
+            acceptedNodes: nodes.length,
+            cycleSkipped,
+        })
+    }
+
+    return nodes
+}
+
+// needed cause there seems to be a bug in `getBoundingClientRect()` in Firefox
+// where it fails to include rects that have zero width and non-zero height
+// (CSSOM spec says "rectangles [...] of which the height or width is not zero")
+// which makes the visible range include an extra space at column boundaries
+const getBoundingClientRect = target => {
+    let top = Infinity, right = -Infinity, left = Infinity, bottom = -Infinity
+    for (const rect of target.getClientRects()) {
+        left = Math.min(left, rect.left)
+        top = Math.min(top, rect.top)
+        right = Math.max(right, rect.right)
+        bottom = Math.max(bottom, rect.bottom)
+    }
+    return new DOMRect(left, top, right - left, bottom - top)
+}
+
+export const getVisibleRange = (doc, start, end, mapRect, options) => {
+    // first get all visible nodes
+    const nodes = getVisibleRangeNodes(doc, start, end, mapRect, options)
 
     // we're only interested in the first and last visible nodes
     const from = nodes[0] ?? doc.body
