@@ -1474,9 +1474,14 @@ export class Paginator extends HTMLElement {
         return this.#renderedStart + this.size
     }
     get #renderedPage() {
+        return this.#pageAtOffset(this.#renderedStart)
+    }
+    #pageAtOffset(offset) {
         if (this.#rtl || this.#vertical)
-            return Math.floor(((this.#renderedStart + this.#renderedEnd) / 2) / this.size)
-        return Math.floor((this.#renderedStart - this.#pageOrigin) / this.size + 0.01)
+            return Math.floor((offset + this.size / 2) / this.size)
+        // A terminal half-spread is browser-clamped between grid positions.
+        // Its midpoint still identifies the requested final logical page.
+        return Math.floor((offset + this.size / 2 - this.#pageOrigin) / this.size + 0.01)
     }
     get #renderedPages() {
         if (this.#rtl || this.#vertical)
@@ -1520,7 +1525,8 @@ export class Paginator extends HTMLElement {
         const d = v * (this.#rtl ? -size : size) * (orthogonal ? 1 : 0)
         const snapOffset = (isNaN(d) ? 0 : snapping ? d * 2 : d * 10)
         const page = Math.floor((Math.max(min, Math.min(max, (start + end) / 2 + snapOffset)) - this.#pageOrigin) / size)
-        if (page < 0 && !this.#rtl && !this.#vertical) return this.prev()
+        if (page < 0 && !this.#rtl && !this.#vertical)
+            return this.#turnPage(-1, undefined, Math.abs(offset))
         const dir = page < 0 && start <= 0 ? -1 : page >= pages ? 1 : null
         const doGoTo = () => {
             if (!dir) return
@@ -1737,8 +1743,8 @@ export class Paginator extends HTMLElement {
         if (!textPages) return
         // textPages is in column units; convert to spread page for scrolling
         const newColumn = Math.round(anchor * (textPages - 1))
-        const newSpreadPage = Math.floor(newColumn / this.columnCount)
-        await this.#scrollToPage(pagesBeforePrimary + newSpreadPage, reason, smooth)
+        const newSpreadPage = Math.floor(pagesBeforePrimary + newColumn / this.columnCount + 0.01)
+        await this.#scrollToPage(newSpreadPage, reason, smooth)
     }
     // Get the pixel offset of a view within the container
     #getViewOffset(index) {
@@ -1749,13 +1755,12 @@ export class Paginator extends HTMLElement {
         }
         return offset
     }
-    // Get number of full pages (spreads) before a given view.
-    // Uses floor so the view's first column is always on or after
-    // the returned page — never rounded past it. The 0.01 tolerance
-    // absorbs sub-pixel drift on fractional-DPR devices where
-    // getBoundingClientRect() accumulates ~0.0001px errors.
+    // View offset in spread units relative to the resume grid. Retain a
+    // fractional spread until combined with the target column: rounding the
+    // two offsets separately loses the column on an odd-column resume.
     #getPagesBeforeView(index) {
-        return Math.floor((this.#getViewOffset(index) - this.#pageOrigin) / this.size + 0.01)
+        const pages = (this.#getViewOffset(index) - this.#pageOrigin) / this.size
+        return this.#rtl || this.#vertical ? Math.floor(pages + 0.01) : pages
     }
     #getVisibleRange() {
         const targetView = this.#primaryView
@@ -2149,17 +2154,17 @@ export class Paginator extends HTMLElement {
         const resolved = await target
         if (this.#canGoToIndex(resolved.index)) return this.#goTo(resolved)
     }
-    #scrollPrev(distance) {
+    #scrollPrev(distance, settledStart = this.#renderedStart) {
         if (this.#views.size === 0) return true
         if (this.scrolled) {
             if (this.#renderedStart > 0) return this.#scrollTo(
                 Math.max(0, this.#renderedStart - (distance ?? this.size)), null, true)
             return !this.atStart
         }
-        if (this.atStart) return
-        const page = this.#renderedPage - 1
+        if (this.atStart && (this.#rtl || this.#vertical || settledStart <= 1)) return
+        const page = this.#pageAtOffset(settledStart) - 1
         // Out of range — skip animation, go straight to previous section
-        if (page < 0) return !this.#rtl && !this.#vertical && this.#renderedStart > 0
+        if (page < 0) return !this.#rtl && !this.#vertical && settledStart > 0
             ? this.#scrollTo(0, 'page', true) : true
         return this.#scrollToPage(page, 'page', true)
     }
@@ -2196,7 +2201,7 @@ export class Paginator extends HTMLElement {
         for (let index = fromIndex + dir; this.#canGoToIndex(index); index += dir)
             if (this.sections[index]?.linear !== 'no') return index
     }
-    async #turnPage(dir, distance) {
+    async #turnPage(dir, distance, settledStart = this.#renderedStart) {
         if (this.#locked) return
         this.#locked = true
         const prev = dir === -1
@@ -2204,7 +2209,7 @@ export class Paginator extends HTMLElement {
         // chapter on its next backward turn. Load that preceding content before
         // turning instead of clamping to zero and repeating half a spread.
         if (prev && !this.scrolled && !this.#rtl && !this.#vertical
-            && this.#pageOrigin > 0 && this.#renderedStart < this.size) {
+            && this.#pageOrigin > 0 && settledStart < this.size) {
             if (this.#fillPromise) await this.#fillPromise
             const firstIndex = this.#sortedViews[0]?.[0]
             const previousIndex = this.#adjacentIndex(-1, firstIndex)
@@ -2216,13 +2221,16 @@ export class Paginator extends HTMLElement {
                     await this.#loadAdjacentSection(previousIndex)
                     const added = this.#getViewOffset(this.#primaryIndex) - before
                     this.#pageOrigin = (this.#pageOrigin + added) % this.size
+                    settledStart += added
+                    // Preserve the dragged visual position while measuring the
+                    // turn from the settled pre-gesture position, just like a button.
                     await this.#scrollTo(start + added, 'anchor')
                 } finally {
                     this.#filling = false
                 }
             }
         }
-        const shouldGo = await (prev ? this.#scrollPrev(distance) : this.#scrollNext(distance))
+        const shouldGo = await (prev ? this.#scrollPrev(distance, settledStart) : this.#scrollNext(distance))
         if (shouldGo) {
             // Wait for any in-progress background pre-loading to complete —
             // it may already be loading the section we need, so awaiting

@@ -69,6 +69,8 @@ export class FixedLayout extends HTMLElement {
     #scrollMaxLoaded = 8
     #scrollIdleTimer = null
     #scrollCurrentIndex = -1
+    #scrollViewport = null
+    #scrollPosition = 0
     constructor() {
         super()
 
@@ -94,6 +96,7 @@ export class FixedLayout extends HTMLElement {
         }
         :host([flow="scrolled"]) .scroll-container {
             display: flex;
+            box-sizing: border-box;
             flex-direction: column;
             align-items: center;
             min-height: 100%;
@@ -439,6 +442,11 @@ export class FixedLayout extends HTMLElement {
         this.#reportScrollLocation('navigation')
     }
     #handleScrollEvent = () => {
+        // A larger viewport can clamp scrollTop before ResizeObserver runs.
+        // Keep the last position measured under the old geometry in that case.
+        if (this.#scrollViewport?.width === this.clientWidth
+            && this.#scrollViewport?.height === this.clientHeight)
+            this.#scrollPosition = this.scrollTop
         // Disable iframe interaction during scroll for native smooth scrolling
         this.#setScrollIframeInteraction(false)
         if (this.#scrollIdleTimer) clearTimeout(this.#scrollIdleTimer)
@@ -479,6 +487,8 @@ export class FixedLayout extends HTMLElement {
         this.#scrollPages = []
         this.#scrollLoadGen.clear()
         this.#scrollCurrentIndex = -1
+        this.#scrollViewport = null
+        this.#scrollPosition = 0
         if (this.#scrollContainer) {
             this.#scrollContainer.remove()
             this.#scrollContainer = null
@@ -638,7 +648,10 @@ export class FixedLayout extends HTMLElement {
         const { width: hostWidth } = this.getBoundingClientRect()
         if (!hostWidth) return
         // Remember current page so we can restore scroll position after resize
-        const currentIndex = this.#getScrollIndex()
+        const resized = this.#scrollViewport
+            && (this.#scrollViewport.width !== this.clientWidth
+                || this.#scrollViewport.height !== this.clientHeight)
+        const currentIndex = this.#getScrollIndex(resized ? this.#scrollPosition : this.scrollTop)
         for (const page of this.#scrollPages) {
             const scale = (hostWidth / page.vpWidth) * this.#scaleFactor
             page.el.style.width = `${page.vpWidth * scale}px`
@@ -647,11 +660,14 @@ export class FixedLayout extends HTMLElement {
                 this.#renderScrollPage(page)
             }
         }
+        this.#updateScrollEndPadding()
         // Restore scroll position to keep current page in view after resize
         if (currentIndex >= 0 && currentIndex < this.#scrollPages.length) {
             this.#scrollPages[currentIndex].el.scrollIntoView()
             this.#scrollCurrentIndex = currentIndex
         }
+        this.#scrollViewport = { width: this.clientWidth, height: this.clientHeight }
+        this.#scrollPosition = this.scrollTop
     }
     #renderScrollPage(pageData) {
         const { width: hostWidth } = this.getBoundingClientRect()
@@ -683,6 +699,7 @@ export class FixedLayout extends HTMLElement {
         // Update placeholder to match actual page dimensions
         pageData.el.style.width = `${vw * scale}px`
         pageData.el.style.height = `${vh * scale}px`
+        if (pageData === this.#scrollPages.at(-1)) this.#updateScrollEndPadding()
 
         const overlayer = this.#overlayers.get(pageData.index)
         if (overlayer) {
@@ -696,24 +713,35 @@ export class FixedLayout extends HTMLElement {
             overlayer.redraw()
         }
     }
-    #getScrollIndex() {
+    #updateScrollEndPadding() {
+        const last = this.#scrollPages.at(-1)?.el
+        if (!last || !this.#scrollContainer) return
+        // Every page, including a short final page, must be able to reach the
+        // same leading edge used by navigation and persisted page-level CFIs.
+        const margin = parseFloat(getComputedStyle(last).marginBottom) || 0
+        this.#scrollContainer.style.paddingBottom = `${Math.max(0,
+            this.clientHeight - last.getBoundingClientRect().height - margin)}px`
+    }
+    #getScrollIndex(position = this.scrollTop) {
         if (!this.#scrollPages.length) return -1
         // goTo() restores a page at the leading viewport edge. Saving the
         // center page instead advances short landscape pages on every reopen
         // in a tall viewport. Use the same leading edge for both operations.
         const top = this.getBoundingClientRect().top + this.clientTop
+            + position - this.scrollTop
         for (const page of this.#scrollPages) {
             const rect = page.el.getBoundingClientRect()
             // Ignore a trailing sub-pixel sliver of the preceding page; in a
             // page gap, the next page is the first visible reading content.
             if (rect.bottom > top + 1) return page.index
         }
-        return this.scrollTop > 0 ? this.#scrollPages.length - 1 : 0
+        return position > 0 ? this.#scrollPages.length - 1 : 0
     }
     #reportScrollLocation(reason = 'scroll') {
         const index = this.#getScrollIndex()
         if (index < 0) return
         this.#scrollCurrentIndex = index
+        this.#scrollPosition = this.scrollTop
         this.dispatchEvent(new CustomEvent('relocate', { detail:
             { reason, range: null, index, fraction: 0, size: 1 } }))
     }
