@@ -317,7 +317,9 @@ export class View extends HTMLElement {
     async init({ lastLocation, showTextStart }) {
         const resolved = lastLocation ? this.resolveNavigation(lastLocation) : null
         if (resolved) {
-            await this.renderer.goTo(resolved)
+            // Resume the saved leading column, not a spread boundary determined
+            // by whichever preceding sections happen to be loaded this session.
+            await this.renderer.goTo({ ...resolved, alignStart: true })
             this.history.pushState(lastLocation)
         }
         else if (showTextStart) await this.goToTextStart()

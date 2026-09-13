@@ -436,6 +436,7 @@ export class FixedLayout extends HTMLElement {
         for (const page of this.#scrollPages) {
             this.#scrollObserver.observe(page.el)
         }
+        this.#reportScrollLocation('navigation')
     }
     #handleScrollEvent = () => {
         // Disable iframe interaction during scroll for native smooth scrolling
@@ -697,26 +698,24 @@ export class FixedLayout extends HTMLElement {
     }
     #getScrollIndex() {
         if (!this.#scrollPages.length) return -1
-        const hostRect = this.getBoundingClientRect()
-        const midY = hostRect.top + hostRect.height / 2
+        // goTo() restores a page at the leading viewport edge. Saving the
+        // center page instead advances short landscape pages on every reopen
+        // in a tall viewport. Use the same leading edge for both operations.
+        const top = this.getBoundingClientRect().top + this.clientTop
         for (const page of this.#scrollPages) {
             const rect = page.el.getBoundingClientRect()
-            if (rect.top <= midY && rect.bottom >= midY) return page.index
+            // Ignore a trailing sub-pixel sliver of the preceding page; in a
+            // page gap, the next page is the first visible reading content.
+            if (rect.bottom > top + 1) return page.index
         }
-        let closest = 0, minDist = Infinity
-        for (const page of this.#scrollPages) {
-            const rect = page.el.getBoundingClientRect()
-            const dist = Math.abs(rect.top + rect.height / 2 - midY)
-            if (dist < minDist) { minDist = dist; closest = page.index }
-        }
-        return closest
+        return this.scrollTop > 0 ? this.#scrollPages.length - 1 : 0
     }
-    #reportScrollLocation() {
+    #reportScrollLocation(reason = 'scroll') {
         const index = this.#getScrollIndex()
         if (index < 0) return
         this.#scrollCurrentIndex = index
         this.dispatchEvent(new CustomEvent('relocate', { detail:
-            { reason: 'scroll', range: null, index, fraction: 0, size: 1 } }))
+            { reason, range: null, index, fraction: 0, size: 1 } }))
     }
     #goLeft() {
         if (this.#center || this.#left?.blank) return
@@ -1039,6 +1038,8 @@ export class FixedLayout extends HTMLElement {
             if (page) {
                 page.el.scrollIntoView()
                 this.#scrollCurrentIndex = resolved.index
+                // No native scroll event fires when already at this position.
+                this.#reportScrollLocation('navigation')
             }
             return
         }
