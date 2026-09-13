@@ -1479,6 +1479,10 @@ export class Paginator extends HTMLElement {
     #pageAtOffset(offset) {
         if (this.#rtl || this.#vertical)
             return Math.floor((offset + this.size / 2) / this.size)
+        // The leading partial spread precedes page zero on a shifted resume
+        // grid. Its midpoint can fall on the origin, but Next must still land
+        // at that origin rather than skip to the following full spread.
+        if (offset < this.#pageOrigin - 1) return -1
         // A terminal half-spread is browser-clamped between grid positions.
         // Its midpoint still identifies the requested final logical page.
         return Math.floor((offset + this.size / 2 - this.#pageOrigin) / this.size + 0.01)
