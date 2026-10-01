@@ -685,6 +685,7 @@ export class FixedLayout extends HTMLElement {
         }
         this.#scrollViewport = { width: this.clientWidth, height: this.clientHeight }
         this.#scrollPosition = this.scrollTop
+        this.#syncPageSnapType()
     }
     #renderScrollPage(pageData) {
         const { width: hostWidth, height: hostHeight } = this.getBoundingClientRect()
@@ -734,6 +735,7 @@ export class FixedLayout extends HTMLElement {
             })
             overlayer.redraw()
         }
+        this.#syncPageSnapType()
     }
     #updateScrollEndPadding() {
         const last = this.#scrollPages.at(-1)?.el
@@ -775,6 +777,16 @@ export class FixedLayout extends HTMLElement {
         doc.addEventListener('touchend', this.#onPageTouchEnd)
         doc.addEventListener('touchcancel', this.#onPageTouchCancel)
     }
+    #currentPageFitsViewport() {
+        const index = this.#getScrollIndex()
+        const page = this.#scrollPages.find(page => page.index === index)
+        return !!page && page.el.offsetHeight <= this.clientHeight + 1
+    }
+    #syncPageSnapType() {
+        if (this.hasAttribute('page-snap') && !this.#currentPageFitsViewport())
+            this.style.scrollSnapType = 'none'
+        else this.style.removeProperty('scroll-snap-type')
+    }
     #beginPageGesture() {
         if (!this.hasAttribute('page-snap')) return
         this.style.scrollSnapType = 'none'
@@ -782,8 +794,12 @@ export class FixedLayout extends HTMLElement {
     #finishPageGesture = () => {
         if (this.#pageGestureTimer) clearTimeout(this.#pageGestureTimer)
         this.#pageGestureTimer = null
+        if (!this.hasAttribute('page-snap') || !this.#scrollPages.length
+            || !this.#currentPageFitsViewport()) {
+            this.#syncPageSnapType()
+            return
+        }
         this.style.removeProperty('scroll-snap-type')
-        if (!this.hasAttribute('page-snap') || !this.#scrollPages.length) return
         const nearest = this.#scrollPages.reduce((best, page) =>
             Math.abs(page.el.offsetTop - this.scrollTop)
                 < Math.abs(best.el.offsetTop - this.scrollTop) ? page : best)
