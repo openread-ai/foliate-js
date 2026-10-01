@@ -32,7 +32,7 @@ const getViewport = (doc, viewport) => {
 }
 
 export class FixedLayout extends HTMLElement {
-    static observedAttributes = ['zoom', 'scale-factor', 'spread', 'flow']
+    static observedAttributes = ['zoom', 'scale-factor', 'spread', 'flow', 'page-snap']
     #root = this.attachShadow({ mode: 'open' })
     #observer = new ResizeObserver(() => this.#render())
     #spreads
@@ -71,6 +71,9 @@ export class FixedLayout extends HTMLElement {
     #scrollCurrentIndex = -1
     #scrollViewport = null
     #scrollPosition = 0
+    #pageGestureTimer = null
+    #pageWheelDelta = 0
+    #pageTouch = null
     constructor() {
         super()
 
@@ -94,6 +97,9 @@ export class FixedLayout extends HTMLElement {
             overflow-y: auto;
             overflow-x: hidden;
         }
+        :host([flow="scrolled"][page-snap]) {
+            scroll-snap-type: y mandatory;
+        }
         :host([flow="scrolled"]) .scroll-container {
             display: flex;
             box-sizing: border-box;
@@ -108,6 +114,14 @@ export class FixedLayout extends HTMLElement {
             flex-shrink: 0;
             overflow: hidden;
             margin: 4px 0;
+        }
+        :host([flow="scrolled"][page-snap]) .scroll-page {
+            align-items: center;
+            display: flex;
+            justify-content: center;
+            margin: 0;
+            scroll-snap-align: start;
+            scroll-snap-stop: always;
         }
         :host([flow="scrolled"]) .scroll-page iframe {
             pointer-events: none;
@@ -140,6 +154,9 @@ export class FixedLayout extends HTMLElement {
                     this.#scrollMode = false
                     this.#render()
                 }
+                break
+            case 'page-snap':
+                if (this.#scrollMode) this.#renderScrollMode(this.#scrollCurrentIndex)
                 break
         }
     }
@@ -179,6 +196,7 @@ export class FixedLayout extends HTMLElement {
                 const doc = iframe.contentDocument
                 iframe.dataset.sectionIndex = index
                 this.dispatchEvent(new CustomEvent('load', { detail: { doc, index } }))
+                this.#listenForPageGestures(doc)
                 const { width, height } = getViewport(doc, this.defaultViewport)
                 resolve({
                     element, iframe,
@@ -605,14 +623,7 @@ export class FixedLayout extends HTMLElement {
                         },
                     },
                 }))
-                // Forward wheel events to host when iframe has pointer-events
-                // (fallback for the brief window after scroll settles)
-                doc.addEventListener('wheel', e => {
-                    // Disable pointer-events immediately so subsequent
-                    // wheel ticks use native scroll
-                    this.#setScrollIframeInteraction(false)
-                    this.scrollBy({ top: e.deltaY, left: e.deltaX, behavior: 'instant' })
-                }, { passive: true })
+                this.#listenForPageGestures(doc)
             }
         } catch (e) {
             console.warn('Failed to load scroll page', pageData.index, e)
@@ -644,18 +655,24 @@ export class FixedLayout extends HTMLElement {
             this.#teardownScrollPage(page)
         }
     }
-    #renderScrollMode() {
-        const { width: hostWidth } = this.getBoundingClientRect()
+    #renderScrollMode(targetIndex) {
+        const { width: hostWidth, height: hostHeight } = this.getBoundingClientRect()
         if (!hostWidth) return
         // Remember current page so we can restore scroll position after resize
         const resized = this.#scrollViewport
             && (this.#scrollViewport.width !== this.clientWidth
                 || this.#scrollViewport.height !== this.clientHeight)
-        const currentIndex = this.#getScrollIndex(resized ? this.#scrollPosition : this.scrollTop)
+        const currentIndex = targetIndex >= 0 ? targetIndex
+            : this.#getScrollIndex(resized ? this.#scrollPosition : this.scrollTop)
         for (const page of this.#scrollPages) {
-            const scale = (hostWidth / page.vpWidth) * this.#scaleFactor
+            const widthScale = hostWidth / page.vpWidth
+            const scale = (this.hasAttribute('page-snap') && this.#zoom !== 'fit-width'
+                ? Math.min(widthScale, hostHeight / page.vpHeight)
+                : widthScale) * this.#scaleFactor
             page.el.style.width = `${page.vpWidth * scale}px`
             page.el.style.height = `${page.vpHeight * scale}px`
+            page.el.style.minHeight = this.hasAttribute('page-snap')
+                ? `${this.clientHeight}px` : ''
             if (page.state === 'loaded' && page.frame) {
                 this.#renderScrollPage(page)
             }
@@ -670,10 +687,13 @@ export class FixedLayout extends HTMLElement {
         this.#scrollPosition = this.scrollTop
     }
     #renderScrollPage(pageData) {
-        const { width: hostWidth } = this.getBoundingClientRect()
+        const { width: hostWidth, height: hostHeight } = this.getBoundingClientRect()
         if (!hostWidth || !pageData.frame) return
         const { vpWidth: vw, vpHeight: vh, frame } = pageData
-        const scale = (hostWidth / vw) * this.#scaleFactor
+        const widthScale = hostWidth / vw
+        const scale = (this.hasAttribute('page-snap') && this.#zoom !== 'fit-width'
+            ? Math.min(widthScale, hostHeight / vh)
+            : widthScale) * this.#scaleFactor
 
         if (frame.onZoom) {
             frame.onZoom({ doc: frame.iframe.contentDocument, scale, pageColors: this.#pageColors })
@@ -699,6 +719,8 @@ export class FixedLayout extends HTMLElement {
         // Update placeholder to match actual page dimensions
         pageData.el.style.width = `${vw * scale}px`
         pageData.el.style.height = `${vh * scale}px`
+        pageData.el.style.minHeight = this.hasAttribute('page-snap')
+            ? `${this.clientHeight}px` : ''
         if (pageData === this.#scrollPages.at(-1)) this.#updateScrollEndPadding()
 
         const overlayer = this.#overlayers.get(pageData.index)
@@ -744,6 +766,100 @@ export class FixedLayout extends HTMLElement {
         this.#scrollPosition = this.scrollTop
         this.dispatchEvent(new CustomEvent('relocate', { detail:
             { reason, range: null, index, fraction: 0, size: 1 } }))
+    }
+    #listenForPageGestures(doc) {
+        doc.addEventListener('wheel', e => this.handleWheel(e.deltaX, e.deltaY),
+            { passive: true })
+        doc.addEventListener('touchstart', this.#onPageTouchStart, { passive: true })
+        doc.addEventListener('touchmove', this.#onPageTouchMove, { passive: false })
+        doc.addEventListener('touchend', this.#onPageTouchEnd)
+        doc.addEventListener('touchcancel', this.#onPageTouchCancel)
+    }
+    #beginPageGesture() {
+        if (!this.hasAttribute('page-snap')) return
+        this.style.scrollSnapType = 'none'
+    }
+    #finishPageGesture = () => {
+        if (this.#pageGestureTimer) clearTimeout(this.#pageGestureTimer)
+        this.#pageGestureTimer = null
+        this.style.removeProperty('scroll-snap-type')
+        if (!this.hasAttribute('page-snap') || !this.#scrollPages.length) return
+        const nearest = this.#scrollPages.reduce((best, page) =>
+            Math.abs(page.el.offsetTop - this.scrollTop)
+                < Math.abs(best.el.offsetTop - this.scrollTop) ? page : best)
+        this.scrollTo({ top: nearest.el.offsetTop, behavior: 'smooth' })
+    }
+    handleWheel(_deltaX, deltaY) {
+        if (!this.#scrollMode) {
+            if (!deltaY) return
+            this.#pageWheelDelta += deltaY
+            if (this.#pageGestureTimer) clearTimeout(this.#pageGestureTimer)
+            this.#pageGestureTimer = setTimeout(() => {
+                const delta = this.#pageWheelDelta
+                this.#pageWheelDelta = 0
+                this.#pageGestureTimer = null
+                if (delta > 0) this.next()
+                else if (delta < 0) this.prev()
+            }, 120)
+            return
+        }
+        this.#beginPageGesture()
+        this.#setScrollIframeInteraction(false)
+        this.scrollBy({ top: deltaY, behavior: 'instant' })
+        if (this.#pageGestureTimer) clearTimeout(this.#pageGestureTimer)
+        if (this.hasAttribute('page-snap'))
+            this.#pageGestureTimer = setTimeout(this.#finishPageGesture, 120)
+    }
+    #onPageTouchStart = e => {
+        if (e.touches.length !== 1) return
+        const { screenX, screenY } = e.touches[0]
+        this.#pageTouch = {
+            startX: screenX,
+            startY: screenY,
+            x: screenX,
+            y: screenY,
+            startedAt: performance.now(),
+        }
+        if (this.#scrollMode) this.#beginPageGesture()
+    }
+    #onPageTouchMove = e => {
+        if (!this.#pageTouch || e.touches.length !== 1) return
+        const selection = e.currentTarget?.getSelection?.()
+        if (selection && !selection.isCollapsed) return
+        const { screenX, screenY } = e.touches[0]
+        if (this.#scrollMode) {
+            e.preventDefault()
+            this.scrollBy({ top: this.#pageTouch.y - screenY, behavior: 'instant' })
+        }
+        this.#pageTouch.x = screenX
+        this.#pageTouch.y = screenY
+    }
+    #onPageTouchEnd = e => {
+        if (!this.#pageTouch) return
+        const touch = e.changedTouches?.[0]
+        if (touch) {
+            this.#pageTouch.x = touch.screenX
+            this.#pageTouch.y = touch.screenY
+        }
+        const gesture = this.#pageTouch
+        this.#pageTouch = null
+        if (this.#scrollMode) {
+            this.#finishPageGesture()
+            return
+        }
+        const selection = e.currentTarget?.getSelection?.()
+        if (selection && !selection.isCollapsed) return
+        const dx = gesture.x - gesture.startX
+        const dy = gesture.y - gesture.startY
+        const dt = Math.max(1, performance.now() - gesture.startedAt)
+        if (Math.abs(dx) <= Math.abs(dy) || Math.abs(dx) <= 30 || Math.abs(dx / dt) <= .2)
+            return
+        if (dx > 0) this.rtl ? this.next() : this.prev()
+        else this.rtl ? this.prev() : this.next()
+    }
+    #onPageTouchCancel = () => {
+        this.#pageTouch = null
+        if (this.#scrollMode) this.#finishPageGesture()
     }
     #goLeft() {
         if (this.#center || this.#left?.blank) return
@@ -1197,6 +1313,7 @@ export class FixedLayout extends HTMLElement {
         return this.#scrollMode ? 'height' : 'width'
     }
     destroy() {
+        if (this.#pageGestureTimer) clearTimeout(this.#pageGestureTimer)
         this.#observer.unobserve(this)
         if (this.#scrollMode) {
             this.removeEventListener('scroll', this.#handleScrollEvent)

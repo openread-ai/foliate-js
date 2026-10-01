@@ -866,6 +866,8 @@ export class Paginator extends HTMLElement {
     #scrollBounds
     #touchState
     #touchScrolled
+    #wheelState
+    #wheelTimer
     #lastVisibleRange
     #scrollLocked = false
     #isAnimating = false
@@ -1507,6 +1509,34 @@ export class Paginator extends HTMLElement {
         const max = rtl ? offset + a : offset + b
         this.containerPosition = Math.max(min, Math.min(max,
             this.containerPosition + delta))
+    }
+
+    handleWheel(deltaX, deltaY) {
+        if (this.scrolled || this.#scrollLocked) return
+        const delta = Math.abs(deltaX) > Math.abs(deltaY) ? deltaX : deltaY
+        if (!delta) return
+        const dx = this.#vertical ? 0 : delta * (this.#rtl ? -1 : 1)
+        const dy = this.#vertical ? delta : 0
+        const now = performance.now()
+        const state = this.#wheelState ?? { dx: 0, dy: 0, startedAt: now }
+        state.dx += dx
+        state.dy += dy
+        this.#wheelState = state
+        this.scrollBy(dx, dy)
+        if (this.#wheelTimer) clearTimeout(this.#wheelTimer)
+        this.#wheelTimer = setTimeout(() => {
+            if (this.scrolled || !this.#wheelState) {
+                this.#wheelState = null
+                this.#wheelTimer = null
+                return
+            }
+            const { dx, dy, startedAt } = this.#wheelState
+            const dt = Math.max(1, performance.now() - startedAt)
+            const clamp = value => Math.max(-0.35, Math.min(0.35, value))
+            this.#wheelState = null
+            this.#wheelTimer = null
+            this.snap(clamp(dx / dt), clamp(dy / dt), dx, dy, dt)
+        }, 120)
     }
 
     // vx, vy: velocity at the end of the swipe (pixels per ms)
@@ -2324,6 +2354,7 @@ export class Paginator extends HTMLElement {
         this.#primaryView?.destroyLoupe()
     }
     destroy() {
+        if (this.#wheelTimer) clearTimeout(this.#wheelTimer)
         this.#observer.unobserve(this)
         this.#destroyAllViews()
         this.#mediaQuery.removeEventListener('change', this.#mediaQueryListener)
