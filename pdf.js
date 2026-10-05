@@ -1,5 +1,6 @@
 const pdfjsPath = path => `/vendor/pdfjs/${path}`
 
+import { checkPreviewSignal, PreviewResources, validatePreviewRequest, fitPreview, canvasPreview } from './page-preview.js'
 import '@pdfjs/pdf.min.mjs'
 const pdfjsLib = globalThis.pdfjsLib
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfjsPath('pdf.worker.min.mjs')
@@ -317,6 +318,7 @@ const makeTOCItem = async (item, pdf) => {
 const MAX_CACHED_PAGES = 8
 
 export const makePDF = async file => {
+    const previews = new PreviewResources()
     const transport = new pdfjsLib.PDFDataRangeTransport(file.size, [])
     transport.requestDataRange = (begin, end) => {
         file.slice(begin, end).arrayBuffer().then(chunk => {
@@ -465,7 +467,43 @@ export const makePDF = async file => {
     }
     book.getTOCFragment = doc => doc.documentElement
     book.getCover = async () => renderPage(await pdf.getPage(1), true)
+    book.getPagePreview = async (index, options) => {
+        const bounds = validatePreviewRequest(index, pdf.numPages, options)
+        const scope = previews.open(options.signal)
+        const canvas = document.createElement('canvas')
+        let page
+        let task
+        const cancel = () => task?.cancel()
+        scope.signal.addEventListener('abort', cancel, { once: true })
+        try {
+            // Preview requests must not evict or clean up pages used by the reader.
+            page = await pdf.getPage(index + 1)
+            checkPreviewSignal(scope.signal)
+            const original = page.getViewport({ scale: 1 })
+            const { width, height, scale } = fitPreview(original.width, original.height, bounds)
+            canvas.width = width
+            canvas.height = height
+            task = page.render({
+                canvasContext: canvas.getContext('2d'),
+                viewport: page.getViewport({ scale }),
+            })
+            await task.promise
+            return await canvasPreview(canvas, scope)
+        } catch (error) {
+            const aborted = scope.signal.aborted
+            scope.release()
+            if (aborted) checkPreviewSignal(scope.signal)
+            throw error
+        } finally {
+            scope.signal.removeEventListener('abort', cancel)
+            canvas.width = 0
+            canvas.height = 0
+            // PDF.js defers cleanup until concurrent render tasks have completed.
+            if (!pageCache.has(index)) page?.cleanup()
+        }
+    }
     book.destroy = () => {
+        previews.destroy()
         // Clean up all cached canvases and revoke blob URLs
         for (const [, entry] of cache) {
             if (entry?.src) URL.revokeObjectURL(entry.src)
