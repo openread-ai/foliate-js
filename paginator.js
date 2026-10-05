@@ -347,6 +347,7 @@ class View {
     #observer = new ResizeObserver(() => this.expand())
     #element = document.createElement('div')
     #iframe = document.createElement('iframe')
+    #loadedDocument = null
     #contentRange = document.createRange()
     #overlayer
     #vertical = false
@@ -388,7 +389,7 @@ class View {
         return this.#element
     }
     get document() {
-        return this.#iframe.contentDocument
+        return this.#loadedDocument
     }
     get contentPages() {
         return this.#contentPages
@@ -397,7 +398,8 @@ class View {
         if (typeof src !== 'string') throw new Error(`${src} is not string`)
         return new Promise(resolve => {
             this.#iframe.addEventListener('load', () => {
-                const doc = this.document
+                const doc = this.#iframe.contentDocument
+                this.#loadedDocument = doc
                 afterLoad?.(doc)
 
                 this.#iframe.setAttribute('aria-label', doc.title)
@@ -830,6 +832,7 @@ class View {
     destroy() {
         if (this.document?.body) this.#observer.unobserve(this.document.body)
         this.destroyLoupe()
+        this.#loadedDocument = null
     }
 }
 
