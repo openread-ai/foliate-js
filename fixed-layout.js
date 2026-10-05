@@ -1259,7 +1259,7 @@ export class FixedLayout extends HTMLElement {
         transform(this.#center ?? this.#right ?? {})
         this.#scrollLocked = false
     }
-    getContents() {
+    getContents({ includeHidden = false } = {}) {
         if (this.#scrollMode) {
             return this.#scrollPages
                 .filter(p => p.state === 'loaded' && p.frame?.iframe)
@@ -1272,7 +1272,7 @@ export class FixedLayout extends HTMLElement {
         return Array.from(this.#root.querySelectorAll('iframe'))
             .filter(frame => {
                 const parent = frame.parentElement
-                return parent && parent.style.visibility !== 'hidden'
+                return includeHidden || (parent && parent.style.visibility !== 'hidden')
             })
             .map(frame => {
                 const index = frame.dataset.sectionIndex != null

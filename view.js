@@ -218,6 +218,7 @@ export class View extends HTMLElement {
     #tocProgress
     #pageProgress
     #cfiProgress
+    #searchGeneration = 0
     #searchResults = new Map()
     #cursorAutohider = new CursorAutohider(this, () =>
         this.hasAttribute('autohide-cursor'))
@@ -297,6 +298,7 @@ export class View extends HTMLElement {
         }
     }
     close() {
+        this.clearSearch()
         this.renderer?.destroy()
         this.renderer?.remove()
         this.#sectionProgress = null
@@ -383,9 +385,12 @@ export class View extends HTMLElement {
     async addAnnotation(annotation, remove) {
         const { value } = annotation
         if (value.startsWith(SEARCH_PREFIX)) {
+            const generation = this.#searchGeneration
             const cfi = value.replace(SEARCH_PREFIX, '')
-            const { index, anchor } = await this.resolveNavigation(cfi)
-            const obj = this.#getOverlayer(index)
+            const resolved = await this.resolveNavigation(cfi)
+            if (generation !== this.#searchGeneration) return
+            const { index, anchor } = resolved
+            const obj = this.#getOverlayer(index, true)
             if (obj) {
                 const { overlayer, doc } = obj
                 if (remove) {
@@ -393,7 +398,10 @@ export class View extends HTMLElement {
                     return
                 }
                 const range = doc ? anchor(doc) : anchor
-                if (range) overlayer.add(value, range, Overlayer.outline)
+                if (range) overlayer.add(value, range, Overlayer.outline, {
+                    color: 'var(--foliate-search-color, red)',
+                    width: 'var(--foliate-search-width, 3)',
+                })
             }
             return
         } else if (value.startsWith(NOTE_PREFIX)) {
@@ -433,8 +441,8 @@ export class View extends HTMLElement {
     deleteAnnotation(annotation) {
         return this.addAnnotation(annotation, true)
     }
-    #getOverlayer(index) {
-        return this.renderer.getContents()
+    #getOverlayer(index, includeHidden = false) {
+        return this.renderer.getContents({ includeHidden })
             .find(x => x.index === index && x.overlayer)
     }
     #createOverlayer({ doc, index }) {
@@ -587,26 +595,34 @@ export class View extends HTMLElement {
     goRight() {
         return this.book.dir === 'rtl' ? this.prev() : this.next()
     }
-    async * #searchSection(matcher, query, index) {
+    async * #searchSection(matcher, query, index, generation) {
         const doc = await this.book.sections[index].createDocument()
-        for (const { range, excerpt } of matcher(doc, query))
-            yield { cfi: this.getCFI(index, range), excerpt }
+        if (generation !== this.#searchGeneration) return
+        for (const { range, excerpt } of matcher(doc, query)) {
+            if (generation !== this.#searchGeneration) return
+            yield { index, cfi: this.getCFI(index, range), excerpt }
+        }
     }
-    async * #searchBook(matcher, query) {
+    async * #searchBook(matcher, query, generation) {
         const { sections } = this.book
         for (const [index, { createDocument }] of sections.entries()) {
+            if (generation !== this.#searchGeneration) return
             if (!createDocument) continue
             const doc = await createDocument()
+            if (generation !== this.#searchGeneration) return
             const subitems = Array.from(matcher(doc, query), ({ range, excerpt }) =>
                 ({ cfi: this.getCFI(index, range), excerpt }))
             const progress = (index + 1) / sections.length
             yield { progress }
+            if (generation !== this.#searchGeneration) return
             if (subitems.length) yield { index, subitems }
         }
     }
     async * search(opts) {
         this.clearSearch()
+        const generation = this.#searchGeneration
         const { searchMatcher } = await import('./search.js')
+        if (generation !== this.#searchGeneration) return
         const { sections } = this.book
         const { query, index, results } = opts
         const matcher = searchMatcher(textWalker,
@@ -620,18 +636,19 @@ export class View extends HTMLElement {
                         yield { progress }
                         yield { index: result.index, subitems: result.subitems }
                     } else {
-                        yield { cfi: result.cfi, excerpt: result.excerpt }
+                        yield { index: result.index ?? index, cfi: result.cfi, excerpt: result.excerpt }
                     }
                 }
             })()
             : index != null
-                ? this.#searchSection(matcher, query, index)
-                : this.#searchBook(matcher, query)
+                ? this.#searchSection(matcher, query, index, generation)
+                : this.#searchBook(matcher, query, generation)
 
         const list = []
         this.#searchResults.set(index, list)
 
         for await (const result of iter) {
+            if (generation !== this.#searchGeneration) return
             if (result.subitems){
                 const list = result.subitems
                     .map(({ cfi }) => ({ value: SEARCH_PREFIX + cfi }))
@@ -652,11 +669,15 @@ export class View extends HTMLElement {
                 yield result
             }
         }
-        yield 'done'
+        if (generation === this.#searchGeneration) yield 'done'
     }
     clearSearch() {
-        for (const list of this.#searchResults.values())
-            for (const item of list) this.deleteAnnotation(item)
+        this.#searchGeneration++
+        for (const { index, overlayer } of this.renderer?.getContents({ includeHidden: true }) ?? []) {
+            if (!overlayer) continue
+            for (const { value } of this.#searchResults.get(index) ?? [])
+                overlayer.remove(value)
+        }
         this.#searchResults.clear()
     }
     async initTTS(granularity = 'word', nodeFilter, highlighter) {
