@@ -264,8 +264,10 @@ export class View extends HTMLElement {
         this.renderer.setAttribute('exportparts', 'head,foot,filter,container')
         this.renderer.addEventListener('load', e => this.#onLoad(e.detail))
         this.renderer.addEventListener('relocate', e => this.#onRelocate(e.detail))
-        this.renderer.addEventListener('create-overlayer', e =>
-            e.detail.attach(this.#createOverlayer(e.detail)))
+        this.renderer.addEventListener('create-overlayer', e => {
+            e.detail.attach(this.#createOverlayer(e.detail))
+            this.#emit('create-overlay', { index: e.detail.index })
+        })
         this.renderer.open(book)
         this.#root.append(this.renderer)
 
@@ -344,6 +346,10 @@ export class View extends HTMLElement {
         this.#emit('relocate', this.lastLocation)
     }
     #onLoad({ doc, index }) {
+        doc.addEventListener('text-geometry-changed', () => {
+            this.renderer?.getContents({ includeHidden: true })
+                .find(content => content.doc === doc)?.overlayer?.redraw()
+        })
         // set language and dir if not already set
         doc.documentElement.lang ||= this.language.canonical ?? ''
         if (!this.language.isCJK)
@@ -474,7 +480,6 @@ export class View extends HTMLElement {
         const list = this.#searchResults.get(index)
         if (list) for (const item of list) this.addAnnotation(item)
 
-        this.#emit('create-overlay', { index })
         return overlayer
     }
     async showAnnotation(annotation) {
