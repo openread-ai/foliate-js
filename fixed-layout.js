@@ -123,7 +123,7 @@ export class FixedLayout extends HTMLElement {
             scroll-snap-align: start;
             scroll-snap-stop: always;
         }
-        :host([flow="scrolled"]) .scroll-page iframe {
+        :host([flow="scrolled"]) .scroll-container.scrolling iframe {
             pointer-events: none;
         }`)
 
@@ -254,10 +254,6 @@ export class FixedLayout extends HTMLElement {
         const transform = ({frame, styles}) => {
             let { element, iframe, width, height, blank, onZoom } = frame
             if (!iframe) return
-            if (onZoom) {
-                const p = onZoom({ doc: frame.iframe.contentDocument, scale, pageColors: this.#pageColors })
-                if (p?.then) renderPromises.push(p)
-            }
             const iframeScale = onZoom ? scale : 1
             const zoomedOut = this.#scaleFactor < 1.0
             Object.assign(iframe.style, {
@@ -281,22 +277,7 @@ export class FixedLayout extends HTMLElement {
                 element.style.display = 'none'
             }
 
-            // position and redraw overlayer to match the scaled iframe
-            const sectionIndex = iframe.dataset.sectionIndex != null
-                ? parseInt(iframe.dataset.sectionIndex) : undefined
-            if (sectionIndex != null) {
-                const overlayer = this.#overlayers.get(sectionIndex)
-                if (overlayer) {
-                    Object.assign(overlayer.element.style, {
-                        position: 'absolute',
-                        top: '0',
-                        left: '0',
-                        width: `${(width ?? blankWidth) * scale}px`,
-                        height: `${(height ?? blankHeight) * scale}px`,
-                    })
-                    overlayer.redraw()
-                }
-            }
+            renderPromises.push(this.#renderFrameOverlayer(frame, scale))
 
             const container= element.parentNode?.host
             if (!container) return
@@ -327,6 +308,46 @@ export class FixedLayout extends HTMLElement {
             this.#isOverflowY = Math.max(leftHeight, rightHeight) > containerHeight
         }
         return renderPromises
+    }
+    async #renderFrameOverlayer(frame, scale) {
+        const generation = (frame.renderGeneration ?? 0) + 1
+        frame.renderGeneration = generation
+        const doc = frame.iframe.contentDocument
+        const index = frame.iframe.dataset.sectionIndex != null
+            ? parseInt(frame.iframe.dataset.sectionIndex) : undefined
+        if (frame.onZoom) {
+            try {
+                await frame.onZoom({ doc, scale, pageColors: this.#pageColors })
+            } catch (error) {
+                console.warn('Failed to render fixed-layout page', index, error)
+                return
+            }
+        }
+        if (frame.renderGeneration !== generation || !frame.iframe.isConnected) return
+        if (index == null || !doc) return
+        let overlayer = this.#overlayers.get(index)
+        if (!overlayer || overlayer.element.parentElement !== frame.element) {
+            this.dispatchEvent(new CustomEvent('create-overlayer', {
+                detail: {
+                    doc, index,
+                    attach: created => {
+                        overlayer = created
+                        this.#overlayers.set(index, created)
+                        frame.element.append(created.element)
+                    },
+                },
+            }))
+        }
+        if (overlayer) {
+            Object.assign(overlayer.element.style, {
+                position: 'absolute',
+                top: '0',
+                left: '0',
+                width: `${frame.width * scale}px`,
+                height: `${frame.height * scale}px`,
+            })
+            overlayer.redraw()
+        }
     }
     async #showSpread({ left, right, center, side, spreadIndex }) {
         this.#left = null
@@ -381,29 +402,6 @@ export class FixedLayout extends HTMLElement {
         // try to resolve CFIs against it.
         const renderPromises = this.#render()
         if (renderPromises.length) await Promise.all(renderPromises)
-
-        const showingFrames = center
-            ? [this.#center]
-            : [this.#left, this.#right]
-        for (const frame of showingFrames) {
-            if (!frame?.iframe) continue
-            const index = frame.iframe.dataset.sectionIndex != null
-                ? parseInt(frame.iframe.dataset.sectionIndex) : undefined
-            if (index != null && !this.#overlayers.has(index)) {
-                const doc = frame.iframe.contentDocument
-                if (doc) {
-                    this.dispatchEvent(new CustomEvent('create-overlayer', {
-                        detail: {
-                            doc, index,
-                            attach: overlayer => {
-                                this.#overlayers.set(index, overlayer)
-                                frame.element.append(overlayer.element)
-                            },
-                        },
-                    }))
-                }
-            }
-        }
     }
     #initScrollMode(targetIndex = 0) {
         const currentIndex = targetIndex
@@ -476,12 +474,7 @@ export class FixedLayout extends HTMLElement {
         }, 150)
     }
     #setScrollIframeInteraction(enabled) {
-        const value = enabled ? 'auto' : ''
-        for (const page of this.#scrollPages) {
-            if (page.frame?.iframe) {
-                page.frame.iframe.style.pointerEvents = value
-            }
-        }
+        this.#scrollContainer?.classList.toggle('scrolling', !enabled)
     }
     #destroyScrollMode() {
         // Use the cached scroll index because by the time attributeChangedCallback
@@ -609,22 +602,10 @@ export class FixedLayout extends HTMLElement {
                 pageData.vpWidth = frame.width
                 pageData.vpHeight = frame.height
             }
-            this.#renderScrollPage(pageData)
-
-            // Create overlayer
+            await this.#renderScrollPage(pageData)
+            if (this.#scrollLoadGen.get(pageData.index) !== gen || !this.#scrollMode) return
             const doc = frame.iframe.contentDocument
-            if (doc) {
-                this.dispatchEvent(new CustomEvent('create-overlayer', {
-                    detail: {
-                        doc, index: pageData.index,
-                        attach: overlayer => {
-                            this.#overlayers.set(pageData.index, overlayer)
-                            frame.element.append(overlayer.element)
-                        },
-                    },
-                }))
-                this.#listenForPageGestures(doc)
-            }
+            if (doc) this.#listenForPageGestures(doc)
         } catch (e) {
             console.warn('Failed to load scroll page', pageData.index, e)
             pageData.state = 'idle'
@@ -697,7 +678,6 @@ export class FixedLayout extends HTMLElement {
             : widthScale) * this.#scaleFactor
 
         if (frame.onZoom) {
-            frame.onZoom({ doc: frame.iframe.contentDocument, scale, pageColors: this.#pageColors })
             Object.assign(frame.iframe.style, {
                 width: `${vw * scale}px`,
                 height: `${vh * scale}px`,
@@ -724,18 +704,8 @@ export class FixedLayout extends HTMLElement {
             ? `${this.clientHeight}px` : ''
         if (pageData === this.#scrollPages.at(-1)) this.#updateScrollEndPadding()
 
-        const overlayer = this.#overlayers.get(pageData.index)
-        if (overlayer) {
-            Object.assign(overlayer.element.style, {
-                position: 'absolute',
-                top: '0',
-                left: '0',
-                width: `${vw * scale}px`,
-                height: `${vh * scale}px`,
-            })
-            overlayer.redraw()
-        }
         this.#syncPageSnapType()
+        return this.#renderFrameOverlayer(frame, scale)
     }
     #updateScrollEndPadding() {
         const last = this.#scrollPages.at(-1)?.el
@@ -820,7 +790,6 @@ export class FixedLayout extends HTMLElement {
             return
         }
         this.#beginPageGesture()
-        this.#setScrollIframeInteraction(false)
         this.scrollBy({ top: deltaY, behavior: 'instant' })
         if (this.#pageGestureTimer) clearTimeout(this.#pageGestureTimer)
         if (this.hasAttribute('page-snap'))
