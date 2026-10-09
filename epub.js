@@ -1,4 +1,5 @@
 import * as CFI from './epubcfi.js'
+import { checkPreviewSignal, PreviewResources, validatePreviewRequest, imagePreview } from './page-preview.js'
 
 const NS = {
     CONTAINER: 'urn:oasis:names:tc:opendocument:xmlns:container',
@@ -1042,6 +1043,7 @@ export class EPUB {
     parser = new DOMParser()
     #loader
     #encryption
+    #previews = new PreviewResources()
     constructor({ entries, loadText, loadBlob, getSize, sha1 }) {
         this.entries = entries.reduce((map, entry) => {
             map.set(entry.filename, entry)
@@ -1173,7 +1175,113 @@ ${doc.querySelector('parsererror').innerText}`)
                 .find(section => section.linear !== 'no').pageSpread ??=
                     this.dir === 'rtl' ? 'left' : 'right'
         }
+        if (this.rendition.layout === 'pre-paginated')
+            this.getPagePreview = this.#getPagePreview.bind(this)
         return this
+    }
+    async #getPagePreview(index, options) {
+        const bounds = validatePreviewRequest(index, this.sections.length, options)
+        const scope = this.#previews.open(options.signal)
+        const item = this.resources.getItemByHref(this.sections[index].id)
+        let loader
+        try {
+            const isSVG = item.mediaType === MIME.SVG
+            if (item.mediaType.startsWith('image/') && !isSVG) {
+                const blob = await this.#encryption.getDecoder(item.href)(
+                    await this.loadBlob(item.href))
+                return await imagePreview(new Blob([blob], { type: item.mediaType }), bounds, scope)
+            }
+            if (![MIME.XHTML, MIME.HTML, MIME.SVG].includes(item.mediaType))
+                throw new Error('Unsupported fixed-page preview document')
+            let doc = await this.loadDocument(item)
+            checkPreviewSignal(scope.signal)
+            const viewport = doc.querySelector('meta[name="viewport"]')?.getAttribute('content')
+                ?? this.rendition.viewport
+            let dimensions = typeof viewport === 'string'
+                ? Object.fromEntries(viewport.split(/[,;\s]+/).filter(Boolean)
+                    .map(value => value.split('='))) : viewport
+            if (isSVG) {
+                const svg = doc.documentElement
+                const viewBox = svg.getAttribute('viewBox')?.trim().split(/[\s,]+/).map(Number)
+                dimensions = {
+                    width: Number(svg.getAttribute('width')) || viewBox?.[2],
+                    height: Number(svg.getAttribute('height')) || viewBox?.[3],
+                }
+            }
+            const width = Number(dimensions?.width)
+            const height = Number(dimensions?.height)
+            if (![width, height].every(value => Number.isFinite(value) && value > 0))
+                throw new Error('Fixed-page preview requires an intrinsic viewport')
+
+            if (isSVG) {
+                const svgDoc = doc
+                doc = this.parser.parseFromString(`<html xmlns="${NS.XHTML}">
+                    <head></head><body style="margin:0"></body></html>`, MIME.XHTML)
+                const svg = doc.importNode(svgDoc.documentElement, true)
+                svg.setAttribute('width', width)
+                svg.setAttribute('height', height)
+                for (const image of svg.querySelectorAll('image[href]')) {
+                    image.setAttributeNS(NS.XLINK, 'xlink:href', image.getAttribute('href'))
+                    image.removeAttribute('href')
+                }
+                for (const child of svgDoc.childNodes) {
+                    if (!(child instanceof ProcessingInstruction) || child.target !== 'xml-stylesheet')
+                        continue
+                    const href = child.data.match(/\bhref\s*=\s*(['"])(.*?)\1/)?.[2]
+                    if (!href) continue
+                    const link = doc.createElementNS(NS.XHTML, 'link')
+                    link.setAttribute('rel', 'stylesheet')
+                    link.setAttribute('href', href)
+                    doc.querySelector('head').append(link)
+                }
+                doc.querySelector('body').append(svg)
+            }
+            for (const element of doc.querySelectorAll(
+                'script, iframe, object, embed, audio, video, form, base, meta[http-equiv]'))
+                element.remove()
+            for (const element of doc.querySelectorAll('*'))
+                for (const attribute of Array.from(element.attributes))
+                    if (/^on/i.test(attribute.name)) element.removeAttribute(attribute.name)
+            const policy = doc.createElementNS(NS.XHTML, 'meta')
+            policy.setAttribute('http-equiv', 'Content-Security-Policy')
+            policy.setAttribute('content', "default-src 'none'; img-src blob: data:; "
+                + "style-src 'unsafe-inline' blob:; font-src blob: data:; "
+                + "base-uri 'none'; form-action 'none'")
+            const head = doc.querySelector('head') ?? doc.documentElement.insertBefore(
+                doc.createElementNS(NS.XHTML, 'head'), doc.documentElement.firstChild)
+            head.prepend(policy)
+            const source = new XMLSerializer().serializeToString(doc)
+
+            // Each preview owns its asset URLs; releasing it cannot unload a reader section.
+            loader = new Loader({
+                loadText: async href => {
+                    checkPreviewSignal(scope.signal)
+                    const value = href === item.href ? source : await this.loadText(href)
+                    checkPreviewSignal(scope.signal)
+                    return value
+                },
+                loadBlob: async href => {
+                    checkPreviewSignal(scope.signal)
+                    const value = await this.#encryption.getDecoder(href)(await this.loadBlob(href))
+                    checkPreviewSignal(scope.signal)
+                    return value
+                },
+                resources: { manifest: this.resources.manifest.map(resource => ({ ...resource })) },
+                entries: this.entries,
+            })
+            scope.add(() => loader.destroy())
+            const url = await loader.loadItem({ ...item, mediaType: isSVG ? MIME.XHTML : item.mediaType })
+            checkPreviewSignal(scope.signal)
+            if (!url) throw new Error('Failed to load fixed-page preview')
+            return { kind: 'document', url, width, height, release: scope.release }
+        } catch (error) {
+            const aborted = scope.signal.aborted
+            scope.release()
+            // A load can finish after abort has released the URLs created so far.
+            loader?.destroy()
+            if (aborted) checkPreviewSignal(scope.signal)
+            throw error
+        }
     }
     async loadDocument(item) {
         const str = await this.loadText(item.href)
@@ -1218,6 +1326,7 @@ ${doc.querySelector('parsererror').innerText}`)
         }
     }
     destroy() {
+        this.#previews.destroy()
         this.#loader?.destroy()
     }
 }

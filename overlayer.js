@@ -76,7 +76,7 @@ export class Overlayer {
     }
     #splitRangeByParagraph(range) {
         const ancestor = range.commonAncestorContainer
-        const paragraphs = Array.from(ancestor.querySelectorAll?.('p, h1, h2, h3, h4') || [])
+        const paragraphs = Array.from(ancestor?.querySelectorAll?.('p, h1, h2, h3, h4') || [])
 
         const splitRanges = []
         paragraphs.forEach((p) => {

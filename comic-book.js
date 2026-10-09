@@ -1,4 +1,7 @@
+import { checkPreviewSignal, PreviewResources, validatePreviewRequest, imagePreview } from './page-preview.js'
+
 export const makeComicBook = async ({ entries, loadBlob, getSize, getComment }, file) => {
+    const previews = new PreviewResources()
     const cache = new Map()
     const urls = new Map()
     const load = async name => {
@@ -45,6 +48,18 @@ export const makeComicBook = async ({ entries, loadBlob, getSize, getComment }, 
         book.metadata = { title: file.name }
     }
     book.getCover = () => loadBlob(files[0])
+    book.getPagePreview = async (index, options) => {
+        const bounds = validatePreviewRequest(index, files.length, options)
+        const scope = previews.open(options.signal)
+        try {
+            return await imagePreview(await loadBlob(files[index]), bounds, scope)
+        } catch (error) {
+            const aborted = scope.signal.aborted
+            scope.release()
+            if (aborted) checkPreviewSignal(scope.signal)
+            throw error
+        }
+    }
     book.sections = files.map(name => ({
         id: name,
         load: () => load(name),
@@ -57,6 +72,7 @@ export const makeComicBook = async ({ entries, loadBlob, getSize, getComment }, 
     book.splitTOCHref = href => [href, null]
     book.getTOCFragment = doc => doc.documentElement
     book.destroy = () => {
+        previews.destroy()
         for (const arr of urls.values())
             for (const url of arr) URL.revokeObjectURL(url)
     }
