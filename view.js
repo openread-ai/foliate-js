@@ -219,6 +219,7 @@ export class View extends HTMLElement {
     #pageProgress
     #cfiProgress
     #searchGeneration = 0
+    #searchController = new AbortController()
     #searchResults = new Map()
     #cursorAutohider = new CursorAutohider(this, () =>
         this.hasAttribute('autohide-cursor'))
@@ -346,9 +347,11 @@ export class View extends HTMLElement {
         this.#emit('relocate', this.lastLocation)
     }
     #onLoad({ doc, index }) {
-        doc.addEventListener('text-geometry-changed', () => {
+        doc.addEventListener('pdf-text-ready', () => {
             this.renderer?.getContents({ includeHidden: true })
                 .find(content => content.doc === doc)?.overlayer?.redraw()
+            for (const item of this.#searchResults.get(index) ?? []) this.addAnnotation(item)
+            this.#emit('create-overlay', { index })
         })
         // set language and dir if not already set
         doc.documentElement.lang ||= this.language.canonical ?? ''
@@ -601,7 +604,13 @@ export class View extends HTMLElement {
         return this.book.dir === 'rtl' ? this.prev() : this.next()
     }
     async * #searchSection(matcher, query, index, generation) {
-        const doc = await this.book.sections[index].createDocument()
+        let doc
+        try {
+            doc = await this.book.sections[index].createDocument({ signal: this.#searchController.signal })
+        } catch (error) {
+            if (generation !== this.#searchGeneration) return
+            throw error
+        }
         if (generation !== this.#searchGeneration) return
         for (const { range, excerpt } of matcher(doc, query)) {
             if (generation !== this.#searchGeneration) return
@@ -613,7 +622,13 @@ export class View extends HTMLElement {
         for (const [index, { createDocument }] of sections.entries()) {
             if (generation !== this.#searchGeneration) return
             if (!createDocument) continue
-            const doc = await createDocument()
+            let doc
+            try {
+                doc = await createDocument({ signal: this.#searchController.signal })
+            } catch (error) {
+                if (generation !== this.#searchGeneration) return
+                throw error
+            }
             if (generation !== this.#searchGeneration) return
             const subitems = Array.from(matcher(doc, query), ({ range, excerpt }) =>
                 ({ cfi: this.getCFI(index, range), excerpt }))
@@ -677,6 +692,8 @@ export class View extends HTMLElement {
         if (generation === this.#searchGeneration) yield 'done'
     }
     clearSearch() {
+        this.#searchController.abort()
+        this.#searchController = new AbortController()
         this.#searchGeneration++
         for (const { index, overlayer } of this.renderer?.getContents({ includeHidden: true }) ?? []) {
             if (!overlayer) continue

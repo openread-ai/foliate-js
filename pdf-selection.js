@@ -1,11 +1,12 @@
+import { getPDFTextLayerLine, getPDFTextLayerQuad } from './pdf-text-layer-geometry.js'
+
 const SVG_NS = 'http://www.w3.org/2000/svg'
 const ACTIVE_ATTRIBUTE = 'data-pdf-selection'
 
 /**
  * @param {Range} range
- * @returns {DOMRect[]}
  */
-export const getPDFSelectionRects = range => {
+const getPDFSelectionFragments = range => {
     const doc = range.startContainer.ownerDocument
     if (!doc || range.collapsed) return []
     const root = range.commonAncestorContainer
@@ -18,11 +19,27 @@ export const getPDFSelectionRects = range => {
             const end = node === range.endContainer ? range.endOffset : node.textContent.length
             const text = node.textContent.slice(start, end)
             if (text.trim()) {
+                const quad = getPDFTextLayerQuad(node.parentElement)
+                const layer = node.parentElement?.closest('.textLayer')
+                if (quad && layer && start === 0 && end === node.textContent.length) {
+                    const bounds = layer.getBoundingClientRect()
+                    const left = Math.min(quad.x1, quad.x2, quad.x3, quad.x4)
+                    const top = Math.min(quad.y1, quad.y2, quad.y3, quad.y4)
+                    const right = Math.max(quad.x1, quad.x2, quad.x3, quad.x4)
+                    const bottom = Math.max(quad.y1, quad.y2, quad.y3, quad.y4)
+                    rects.push({ rect: new DOMRect(bounds.left + left * bounds.width,
+                        bounds.top + top * bounds.height, (right - left) * bounds.width,
+                        (bottom - top) * bounds.height), quad, line: getPDFTextLayerLine(node.parentElement) })
+                    node = walker.nextNode()
+                    continue
+                }
                 const selected = doc.createRange()
                 selected.setStart(node, start)
                 selected.setEnd(node, end)
                 for (const rect of selected.getClientRects()) {
-                    if (rect.width > 0 && rect.height > 0) rects.push(rect)
+                    if (rect.width > 0 && rect.height > 0) rects.push({
+                        rect, line: getPDFTextLayerLine(node.parentElement),
+                    })
                 }
             }
         }
@@ -31,23 +48,77 @@ export const getPDFSelectionRects = range => {
     return rects
 }
 
-const mergeLineRects = rects => {
-    const merged = []
-    for (const rect of rects.sort((a, b) => a.top - b.top || a.left - b.left)) {
-        const match = merged.find(line => {
-            const height = Math.min(line.bottom - line.top, rect.bottom - rect.top)
-            const centerDistance = Math.abs(line.top + line.bottom - rect.top - rect.bottom) / 2
-            const gap = Math.max(line.left - rect.right, rect.left - line.right, 0)
-            return centerDistance <= height / 4 && gap <= height * 0.75
-        })
-        if (match) {
-            match.left = Math.min(match.left, rect.left)
-            match.right = Math.max(match.right, rect.right)
-            match.top = Math.min(match.top, rect.top)
-            match.bottom = Math.max(match.bottom, rect.bottom)
-        } else merged.push({ ...rect })
+/**
+ * @param {Range} range
+ * @returns {DOMRect[]}
+ */
+export const getPDFSelectionRects = range =>
+    getPDFSelectionFragments(range).map(({ rect }) => rect)
+
+/** @param {Range} range */
+export const getPDFSelectionQuads = range => {
+    const layer = range.startContainer.ownerDocument?.querySelector('.textLayer')
+    const bounds = layer?.getBoundingClientRect()
+    if (!bounds?.width || !bounds.height) return []
+    const normalized = value => Number(Math.min(1, Math.max(0, value)).toFixed(6))
+    return getPDFSelectionFragments(range).map(({ rect, quad }) => {
+        if (quad) return quad
+        const x1 = normalized((rect.left - bounds.left) / bounds.width)
+        const y1 = normalized((rect.top - bounds.top) / bounds.height)
+        const x2 = normalized(x1 + normalized(rect.width / bounds.width))
+        const y3 = normalized(y1 + normalized(rect.height / bounds.height))
+        return { x1, y1, x2, y2: y1, x3: x2, y3, x4: x1, y4: y3 }
+    })
+}
+
+/**
+ * @param {Range} range
+ * @returns {DOMRect[]}
+ */
+export const getPDFSelectionPaintRects = range => {
+    const lines = new Map()
+    const unmatched = []
+    for (const { rect, line } of getPDFSelectionFragments(range)) {
+        if (line === undefined) {
+            unmatched.push(rect)
+            continue
+        }
+        const previous = lines.get(line)
+        lines.set(line, previous ? {
+            left: Math.min(previous.left, rect.left),
+            top: Math.min(previous.top, rect.top),
+            right: Math.max(previous.right, rect.right),
+            bottom: Math.max(previous.bottom, rect.bottom),
+        } : { left: rect.left, top: rect.top, right: rect.right, bottom: rect.bottom })
     }
-    return merged
+    return [...lines.values(), ...mergePDFLineRects(unmatched)]
+        .sort((a, b) => a.top - b.top || a.left - b.left)
+        .map(({ left, top, right, bottom }) => new DOMRect(left, top, right - left, bottom - top))
+}
+
+/** @param {ReadonlyArray<Pick<DOMRect, 'left' | 'right' | 'top' | 'bottom'>>} rects */
+export const mergePDFLineRects = rects => {
+    const merged = []
+    for (const rect of [...rects].sort((a, b) => a.top - b.top || a.left - b.left)) {
+        let { left, right, top, bottom } = rect
+        for (let index = 0; index < merged.length;) {
+            const line = merged[index]
+            const height = Math.min(line.height, bottom - top)
+            const centerDistance = Math.abs(line.top + line.bottom - top - bottom) / 2
+            const gap = Math.max(line.left - right, left - line.right, 0)
+            if (centerDistance <= height / 4 && gap <= height * 0.75) {
+                left = Math.min(left, line.left)
+                right = Math.max(right, line.right)
+                top = Math.min(top, line.top)
+                bottom = Math.max(bottom, line.bottom)
+                merged.splice(index, 1)
+                // The expanded line can now connect an earlier OCR fragment.
+                index = 0
+            } else index++
+        }
+        merged.push({ left, right, top, bottom, width: right - left, height: bottom - top })
+    }
+    return merged.sort((a, b) => a.top - b.top || a.left - b.left)
 }
 
 export const setupPDFSelection = doc => {
@@ -56,7 +127,7 @@ export const setupPDFSelection = doc => {
     const svg = doc.createElementNS(SVG_NS, 'svg')
     const path = doc.createElementNS(SVG_NS, 'path')
     const style = doc.createElement('style')
-    style.textContent = `.textLayer[${ACTIVE_ATTRIBUTE}] ::selection { background: transparent; }`
+    style.textContent = `.textLayer[${ACTIVE_ATTRIBUTE}]::selection, .textLayer[${ACTIVE_ATTRIBUTE}] ::selection { background: transparent; }`
     svg.setAttribute('aria-hidden', 'true')
     svg.setAttribute('data-pdf-selection-overlay', '')
     Object.assign(svg.style, {
@@ -111,7 +182,7 @@ export const setupPDFSelection = doc => {
             }
             node = walker.nextNode()
         }
-        for (const rect of getPDFSelectionRects(range)) rects.push({
+        for (const rect of getPDFSelectionPaintRects(range)) rects.push({
             left: (rect.left - matrix.e) / matrix.a,
             right: (rect.right - matrix.e) / matrix.a,
             top: (rect.top - matrix.f) / matrix.d,
@@ -119,7 +190,7 @@ export const setupPDFSelection = doc => {
         })
         if (!rects.length) return
         path.setAttribute('fill', color || 'rgba(0, 0, 255, 0.25)')
-        path.setAttribute('d', mergeLineRects(rects).map(({ left, right, top, bottom }) =>
+        path.setAttribute('d', rects.map(({ left, right, top, bottom }) =>
             `M ${left} ${top} H ${right} V ${bottom} H ${left} Z`).join(' '))
         container.setAttribute(ACTIVE_ATTRIBUTE, '')
     }

@@ -2,8 +2,8 @@ const pdfjsPath = path => `/vendor/pdfjs/${path}`
 
 import { checkPreviewSignal, PreviewResources, validatePreviewRequest, fitPreview, canvasPreview } from './page-preview.js'
 import { setupPDFSelection } from './pdf-selection.js'
-import { alignPDFTextGeometry } from './pdf-text-geometry.js'
-import { fitPDFTextLayer, resetPDFTextLayerGeometry } from './pdf-text-layer-geometry.js'
+import { needsPDFRecognition, prepareRecognizedPDFText } from './pdf-text-geometry.js'
+import { createRecognizedPDFTextLayer } from './pdf-text-layer-geometry.js'
 import '@pdfjs/pdf.min.mjs'
 const pdfjsLib = globalThis.pdfjsLib
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfjsPath('pdf.worker.min.mjs')
@@ -65,9 +65,11 @@ const setupPanningEvents = (doc) => {
         const elementUnderCursor = doc.elementFromPoint(e.clientX, e.clientY)
         const hasTextUnderneath = elementUnderCursor &&
                              (elementUnderCursor.tagName === 'SPAN' || elementUnderCursor.tagName === 'P') &&
-                             elementUnderCursor.textContent.trim().length > 0
+                             (elementUnderCursor.textContent.trim().length > 0 ||
+                              elementUnderCursor.hasAttribute('data-pdf-text-space'))
 
         if (!hasTextUnderneath && !hasTextSelection) {
+            e.preventDefault()
             isPanning = true
             startX = e.screenX
             startY = e.screenY
@@ -135,13 +137,12 @@ const setupPanningEvents = (doc) => {
     container.style.cursor = 'grab'
 }
 
-const render = async (page, doc, zoom, pageColors, geometry) => {
+const render = async (page, doc, zoom, pageColors, prepareText) => {
     if (!doc) return
 
     // Increment generation to invalidate any in-progress render for this doc
     const generation = (renderGenerations.get(doc) || 0) + 1
     renderGenerations.set(doc, generation)
-    textLayers.get(doc)?.selection.clear()
 
     // Cancel any in-progress render task for this document
     const existingTask = activeRenderTasks.get(doc)
@@ -203,36 +204,65 @@ const render = async (page, doc, zoom, pageColors, geometry) => {
     }
     canvasElement.replaceChildren(doc.adoptNode(canvas))
 
-    // Keep text nodes stable so selections and CFI highlight ranges survive zoom.
     const container = doc.querySelector('.textLayer')
-    let textLayerState = textLayers.get(doc)
-    if (!textLayerState) {
-        const layer = new pdfjsLib.TextLayer({
-            textContentSource: page.streamTextContent(),
-            container, viewport,
-        })
-        textLayerState = { layer, ready: layer.render(), selection: setupPDFSelection(doc) }
-        textLayers.set(doc, textLayerState)
-    }
-    try {
-        await textLayerState.ready
-    } catch (error) {
-        if (textLayers.get(doc) === textLayerState) {
-            textLayers.delete(doc)
-            textLayerState.selection.destroy()
-            container.replaceChildren()
+    let state = textLayers.get(doc)
+    if (!state) {
+        const controller = new AbortController()
+        state = { viewport, controller, layer: null, selection: null }
+        textLayers.set(doc, state)
+        doc.defaultView.addEventListener('pagehide', () => {
+            controller.abort()
+            state.selection?.destroy()
+        }, { once: true })
+        const status = doc.createElement('div')
+        status.dataset.pdfTextStatus = ''
+        status.setAttribute('role', 'status')
+        status.setAttribute('aria-live', 'polite')
+        Object.assign(status.style, { position: 'absolute', zIndex: '5',
+            top: `${12 * devicePixelRatio}px`, left: `${12 * devicePixelRatio}px`,
+            padding: `${6 * devicePixelRatio}px`, borderRadius: `${4 * devicePixelRatio}px`,
+            background: 'Canvas', color: 'CanvasText', font: `${14 * devicePixelRatio}px sans-serif` })
+        const start = async () => {
+            status.remove()
+            container.setAttribute('aria-busy', 'true')
+            try {
+                const model = await prepareText('visible', controller.signal)
+                if (controller.signal.aborted || !doc.defaultView) return
+                if (model.kind === 'recognized') {
+                    state.layer = createRecognizedPDFTextLayer(container, model)
+                } else {
+                    state.layer = new pdfjsLib.TextLayer({
+                        textContentSource: model.content, container, viewport: state.viewport,
+                    })
+                    await state.layer.render()
+                }
+                if (controller.signal.aborted || !doc.defaultView) return
+                state.layer.update({ viewport: state.viewport })
+                container.removeAttribute('aria-busy')
+                const end = doc.createElement('div')
+                end.className = 'endOfContent'
+                container.append(end)
+                state.selection = setupPDFSelection(doc)
+                setupPanningEvents(doc)
+                doc.dispatchEvent(new CustomEvent('pdf-text-ready'))
+            } catch (error) {
+                if (controller.signal.aborted || !doc.defaultView) return
+                container.removeAttribute('aria-busy')
+                status.textContent = 'Text could not be prepared. '
+                const retry = doc.createElement('button')
+                retry.type = 'button'
+                retry.textContent = 'Retry'
+                retry.onclick = () => void start()
+                status.append(retry)
+                doc.body.append(status)
+            }
         }
-        throw error
+        void start()
+    } else {
+        state.viewport = viewport
+        state.layer?.update({ viewport })
+        state.selection?.update()
     }
-
-    // Bail out if superseded after async text layer render
-    if (renderGenerations.get(doc) !== generation || !doc.defaultView) return
-    resetPDFTextLayerGeometry(textLayerState.layer)
-    textLayerState.layer.update({ viewport })
-    await geometry?.apply(doc, textLayerState.layer, viewport,
-        () => renderGenerations.get(doc) === generation)
-    if (renderGenerations.get(doc) !== generation || !doc.defaultView) return
-    textLayerState.selection.update()
 
     // hide "offscreen" canvases appended to document when rendering text layer
     // https://github.com/mozilla/pdf.js/blob/642b9a5ae67ef642b9a8808fd9efd447e8c350e2/web/pdf_viewer.css#L51-L58
@@ -245,17 +275,6 @@ const render = async (page, doc, zoom, pageColors, geometry) => {
             height: '0',
             display: 'none',
         })
-
-    // fix text selection
-    // https://github.com/mozilla/pdf.js/blob/642b9a5ae67ef642b9a8808fd9efd447e8c350e2/web/text_layer_builder.js#L105-L107
-    if (!container.querySelector('.endOfContent')) {
-        const endOfContent = doc.createElement('div')
-        endOfContent.className = 'endOfContent'
-        container.append(endOfContent)
-    }
-
-    // Set up panning/selection event handlers once per document
-    setupPanningEvents(doc)
 
     // Clear annotation layer before re-rendering to prevent DOM accumulation
     const div = doc.querySelector('.annotationLayer')
@@ -270,7 +289,7 @@ const render = async (page, doc, zoom, pageColors, geometry) => {
     })
 }
 
-const renderPage = async (page, getImageBlob, geometry) => {
+const renderPage = async (page, getImageBlob, prepareText) => {
     const viewport = page.getViewport({ scale: 1 })
     if (getImageBlob) {
         const canvas = document.createElement('canvas')
@@ -311,7 +330,7 @@ const renderPage = async (page, getImageBlob, geometry) => {
         <div class="annotationLayer"></div>
     `
     const src = URL.createObjectURL(new Blob([data], { type: 'text/html' }))
-    const onZoom = ({ doc, scale, pageColors }) => render(page, doc, scale, pageColors, geometry)
+    const onZoom = ({ doc, scale, pageColors }) => render(page, doc, scale, pageColors, prepareText)
     return { src, data, onZoom }
 }
 
@@ -342,6 +361,9 @@ const makeTOCItem = async (item, pdf) => {
 }
 
 const MAX_CACHED_PAGES = 8
+const checkAbortSignal = signal => {
+    if (signal.aborted) throw signal.reason ?? new DOMException('Aborted', 'AbortError')
+}
 
 export const makePDF = async file => {
     const previews = new PreviewResources()
@@ -387,95 +409,113 @@ export const makePDF = async file => {
 
     const cache = new Map()
     const pageCache = new Map()
-    const geometryCache = new Map()
-    const geometryDocuments = new Set()
+    const preparedPages = new Map()
+    const pinnedPages = new Map()
+    const pageMetadata = new Map()
     const lifetime = new AbortController()
-    let geometrySource
-    let repairInProgress = false
-    const getGeometry = async index => {
-        if (!geometrySource) return null
-        let pending = geometryCache.get(index)
-        if (!pending) {
-            pending = geometrySource.read(index).then(async recognized => recognized
-                ? alignPDFTextGeometry((await (await pdf.getPage(index + 1)).getTextContent()).items, recognized)
-                : null)
-            geometryCache.set(index, pending)
+    let recognitionSource
+    book.configureTextRecognition = source => {
+        if (recognitionSource === source) return
+        recognitionSource?.dispose()
+        recognitionSource = source
+    }
+    const remember = (map, index, value) => {
+        map.delete(index)
+        map.set(index, value)
+        while (map.size > MAX_CACHED_PAGES) map.delete(map.keys().next().value)
+        return value
+    }
+    const publishPreparedText = (index, model, priority, signal) => {
+        const pinned = pinnedPages.get(index)
+        const canonical = pinned?.model ?? preparedPages.get(index) ?? model
+        remember(preparedPages, index, canonical)
+        if (priority === 'visible') {
+            const entry = pinned ?? { model: canonical, signals: new Set() }
+            pinnedPages.set(index, entry)
+            if (!entry.signals.has(signal)) {
+                entry.signals.add(signal)
+                signal.addEventListener('abort', () => {
+                    entry.signals.delete(signal)
+                    if (!entry.signals.size && pinnedPages.get(index) === entry)
+                        pinnedPages.delete(index)
+                }, { once: true })
+            }
         }
-        while (geometryCache.size > MAX_CACHED_PAGES) geometryCache.delete(geometryCache.keys().next().value)
-        const value = await pending
-        return geometryCache.has(index) && geometryCache.get(index) !== pending
-            ? geometryCache.get(index) : value
+        return canonical
     }
-    book.configureTextGeometry = source => {
-        geometrySource = source
-        geometryCache.clear()
-    }
-    const pageGeometry = index => ({
-        apply: async (doc, layer, viewport, isCurrent) => {
-            const geometry = await getGeometry(index)
-            if (lifetime.signal.aborted || !doc.defaultView || !isCurrent()) return
-            for (const entry of geometryDocuments) {
-                const previous = entry.doc.deref()
-                if (!previous?.defaultView || previous === doc) geometryDocuments.delete(entry)
-            }
-            geometryDocuments.add({ index, doc: new WeakRef(doc), layer: new WeakRef(layer),
-                viewport, generation: renderGenerations.get(doc) })
-            if (geometry) fitPDFTextLayer(layer, geometry.boxes, viewport)
-        },
-    })
-    book.repairTextGeometry = async (index, options) => {
-        if (!Number.isInteger(index) || index < 0 || index >= pdf.numPages) throw new RangeError('Invalid page')
-        if (!geometrySource) throw new Error('Text alignment is unavailable')
-        if (repairInProgress) throw new Error('Another page is being aligned')
-        const source = geometrySource
-        const signal = AbortSignal.any([options.signal, lifetime.signal])
-        signal.throwIfAborted()
-        repairInProgress = true
-        const canvas = document.createElement('canvas')
-        let page
-        let task
-        const cancel = () => task?.cancel()
-        signal.addEventListener('abort', cancel, { once: true })
+    const preparePageText = async (index, priority, callerSignal) => {
+        const controller = new AbortController()
+        const signal = controller.signal
+        const abort = () => controller.abort(callerSignal.reason ?? lifetime.signal.reason)
+        callerSignal.addEventListener('abort', abort, { once: true })
+        lifetime.signal.addEventListener('abort', abort, { once: true })
+        if (callerSignal.aborted || lifetime.signal.aborted) abort()
         try {
-            page = await pdf.getPage(index + 1)
-            signal.throwIfAborted()
-            const original = page.getViewport({ scale: 1 })
-            // Recognition uses the displayed orientation; normalized boxes survive zoom.
-            const scale = 1600 / Math.max(original.width, original.height)
-            const viewport = page.getViewport({ scale })
-            canvas.width = Math.ceil(viewport.width)
-            canvas.height = Math.ceil(viewport.height)
-            task = page.render({ canvasContext: canvas.getContext('2d'), viewport })
-            await task.promise
-            signal.throwIfAborted()
-            const image = await new Promise(resolve => canvas.toBlob(resolve))
-            if (!image) throw new Error('Could not render this page')
-            const recognized = await source.recognize(image, { ...options, signal })
-            signal.throwIfAborted()
-            const geometry = alignPDFTextGeometry((await page.getTextContent()).items, recognized)
-            if (!geometry.matchedWords) throw new Error('No words could be aligned reliably on this page')
-            signal.throwIfAborted()
-            await source.write(index, recognized)
-            signal.throwIfAborted()
-            geometryCache.set(index, Promise.resolve(geometry))
-            for (const entry of geometryDocuments) {
-                const doc = entry.doc.deref()
-                const layer = entry.layer.deref()
-                if (!doc?.defaultView || !layer) { geometryDocuments.delete(entry); continue }
-                if (entry.index !== index) continue
-                if (renderGenerations.get(doc) !== entry.generation) continue
-                doc.getSelection()?.removeAllRanges()
-                resetPDFTextLayerGeometry(layer)
-                fitPDFTextLayer(layer, geometry.boxes, entry.viewport)
-                textLayers.get(doc)?.selection.clear()
-                doc.dispatchEvent(new CustomEvent('text-geometry-changed'))
+            checkAbortSignal(signal)
+            const ready = pinnedPages.get(index)?.model ?? preparedPages.get(index)
+            if (ready) return publishPreparedText(index, ready, priority, callerSignal)
+            let metadata = pageMetadata.get(index)
+            if (!metadata) {
+                metadata = (async () => {
+                    const page = await getPage(index)
+                    const [content, operators] = await Promise.all([
+                        page.getTextContent(), page.getOperatorList(),
+                    ])
+                    const viewport = page.getViewport({ scale: 1 })
+                    return { page, content, viewport,
+                        recognize: needsPDFRecognition(content, operators, viewport, pdfjsLib.OPS) }
+                })()
+                remember(pageMetadata, index, metadata)
+                metadata.catch(() => {
+                    if (pageMetadata.get(index) === metadata) pageMetadata.delete(index)
+                })
             }
-            return { matchedWords: geometry.matchedWords, totalWords: geometry.totalWords }
+            const { page, content, viewport, recognize } = await metadata
+            checkAbortSignal(signal)
+            if (!recognize) return publishPreparedText(index,
+                Object.freeze({ kind: 'embedded', content }), priority, callerSignal)
+            if (!recognitionSource) throw new Error('Text recognition is unavailable')
+            // Aim for 300 dpi, bound both the longest edge and total raster memory.
+            const scale = Math.min(300 / 72, 2800 / Math.max(viewport.width, viewport.height),
+                Math.sqrt(6_000_000 / (viewport.width * viewport.height)))
+            const recognized = await recognitionSource.get({
+                pageIndex: index, priority, signal,
+                key: JSON.stringify({ crop: page.view, rotation: viewport.rotation,
+                    width: viewport.width, height: viewport.height, raster: '300dpi-2800-6mp-8mib-v2' }),
+                rasterize: async recognitionSignal => {
+                    checkAbortSignal(recognitionSignal)
+                    const canvas = document.createElement('canvas')
+                    const rasterViewport = page.getViewport({ scale })
+                    canvas.width = Math.ceil(rasterViewport.width)
+                    canvas.height = Math.ceil(rasterViewport.height)
+                    const task = page.render({ canvasContext: canvas.getContext('2d'), viewport: rasterViewport })
+                    const cancel = () => task.cancel()
+                    recognitionSignal.addEventListener('abort', cancel, { once: true })
+                    try {
+                        await task.promise
+                        checkAbortSignal(recognitionSignal)
+                        let blob = await new Promise(resolve => canvas.toBlob(resolve))
+                        for (const quality of [0.92, 0.8]) {
+                            checkAbortSignal(recognitionSignal)
+                            if (blob && blob.size <= 8 * 1024 * 1024) break
+                            blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/jpeg', quality))
+                        }
+                        checkAbortSignal(recognitionSignal)
+                        if (!blob) throw new Error('Could not prepare the page image')
+                        if (blob.size > 8 * 1024 * 1024) throw new Error('Page image exceeds the recognition size limit')
+                        return blob
+                    } finally {
+                        recognitionSignal.removeEventListener('abort', cancel)
+                        canvas.width = canvas.height = 0
+                    }
+                },
+            })
+            checkAbortSignal(signal)
+            const previous = pinnedPages.get(index)?.model ?? preparedPages.get(index)
+            return publishPreparedText(index, previous ?? prepareRecognizedPDFText(recognized), priority, callerSignal)
         } finally {
-            signal.removeEventListener('abort', cancel)
-            canvas.width = canvas.height = 0
-            if (!pageCache.has(index)) page?.cleanup()
-            repairInProgress = false
+            callerSignal.removeEventListener('abort', abort)
+            lifetime.signal.removeEventListener('abort', abort)
         }
     }
     const getPage = async (i) => {
@@ -509,7 +549,7 @@ export const makePDF = async file => {
                 cache.set(i, cached)
                 return cached
             }
-            const url = await renderPage(await getPage(i), false, pageGeometry(i))
+            const url = await renderPage(await getPage(i), false, (priority, signal) => preparePageText(i, priority, signal))
             cache.set(i, url)
 
             // Evict oldest render results when over limit
@@ -522,7 +562,8 @@ export const makePDF = async file => {
 
             return url
         },
-        createDocument: async () => {
+        createDocument: async ({ signal = lifetime.signal } = {}) => {
+            const model = await preparePageText(i, 'search', signal)
             const page = await getPage(i)
             const doc = document.implementation.createHTMLDocument('')
 
@@ -538,18 +579,14 @@ export const makePDF = async file => {
             annotationLayer.className = 'annotationLayer'
             doc.body.appendChild(annotationLayer)
 
-            // TextLayer requires canvas 2d context for font metrics;
-            // fall back to manual span construction when unavailable
-            const probe = doc.createElement('canvas')
-            if (probe.getContext?.('2d')) {
-                const textLayerInstance = new pdfjsLib.TextLayer({
-                    textContentSource: await page.streamTextContent(),
-                    container: textLayer, viewport: page.getViewport({ scale: 1 }),
-                })
-                await textLayerInstance.render()
-            } else {
-                const content = await page.getTextContent()
-                for (const item of content.items) {
+            if (model.kind === 'recognized') createRecognizedPDFTextLayer(textLayer, model)
+            else {
+                const probe = doc.createElement('canvas')
+                if (probe.getContext?.('2d')) {
+                    const layer = new pdfjsLib.TextLayer({ textContentSource: model.content,
+                        container: textLayer, viewport: page.getViewport({ scale: 1 }) })
+                    await layer.render()
+                } else for (const item of model.content.items) {
                     if (item.str) {
                         const span = doc.createElement('span')
                         span.textContent = item.str
@@ -621,8 +658,10 @@ export const makePDF = async file => {
     }
     book.destroy = () => {
         lifetime.abort()
-        geometryCache.clear()
-        geometryDocuments.clear()
+        preparedPages.clear()
+        pinnedPages.clear()
+        pageMetadata.clear()
+        recognitionSource?.dispose()
         previews.destroy()
         // Clean up all cached canvases and revoke blob URLs
         for (const [, entry] of cache) {
