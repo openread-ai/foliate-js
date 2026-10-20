@@ -55,9 +55,18 @@ const extractFootnote = (doc, anchor) => {
 
 export class FootnoteHandler extends EventTarget {
     detectFootnotes = true
-    #showFragment(book, { index, anchor }, href) {
+    #showFragment(book, { index, anchor }, href, signal) {
         const view = document.createElement('foliate-view')
         return new Promise((resolve, reject) => {
+            const fail = error => {
+                signal?.removeEventListener('abort', onAbort)
+                view.close()
+                view.remove()
+                reject(error)
+            }
+            const onAbort = () => fail(signal.reason)
+            if (signal?.aborted) return onAbort()
+            signal?.addEventListener('abort', onAbort, { once: true })
             view.addEventListener('load', e => {
                 try {
                     const { doc } = e.detail
@@ -115,30 +124,41 @@ export class FootnoteHandler extends EventTarget {
                     }
                     const detail = { view, href, type, hidden, target: el }
                     this.dispatchEvent(new CustomEvent('render', { detail }))
+                    signal?.removeEventListener('abort', onAbort)
                     resolve()
                 } catch (e) {
-                    reject(e)
+                    fail(e)
                 }
-            })
+            }, { once: true, signal })
             view.open(book)
-                .then(() => this.dispatchEvent(new CustomEvent('before-render', { detail: { view } })))
-                .then(() => view.goTo(index))
-                .catch(reject)
+                .then(() => {
+                    // open() can allocate its renderer after cancellation closed the view.
+                    if (signal?.aborted) {
+                        view.close()
+                        return
+                    }
+                    this.dispatchEvent(new CustomEvent('before-render', { detail: { view } }))
+                    if (!signal?.aborted) return view.goTo(index)
+                })
+                .catch(fail)
         })
     }
-    handle(book, e) {
+    handle(book, e, signal) {
         const { a, href, follow } = e.detail
         const { yes, maybe } = isFootnoteReference(a)
         if (yes || follow) {
             e.preventDefault()
-            return Promise.resolve(book.resolveHref(href)).then(target =>
-                this.#showFragment(book, target, href))
+            return Promise.resolve().then(() => book.resolveHref(href)).then(target => {
+                if (signal?.aborted) throw signal.reason
+                return this.#showFragment(book, target, href, signal)
+            })
         }
         else if (this.detectFootnotes && maybe()) {
             e.preventDefault()
-            return Promise.resolve(book.resolveHref(href)).then(({ index, anchor }) => {
+            return Promise.resolve().then(() => book.resolveHref(href)).then(({ index, anchor }) => {
+                if (signal?.aborted) throw signal.reason
                 const target = { index, anchor: doc => extractFootnote(doc, anchor) }
-                return this.#showFragment(book, target, href)
+                return this.#showFragment(book, target, href, signal)
             })
         }
     }
