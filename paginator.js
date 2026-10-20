@@ -347,6 +347,9 @@ class View {
     #observer = new ResizeObserver(() => this.expand())
     #element = document.createElement('div')
     #iframe = document.createElement('iframe')
+    #loadedDocument = null
+    #destroyed = false
+    #cancelLoad
     #contentRange = document.createRange()
     #overlayer
     #vertical = false
@@ -388,17 +391,29 @@ class View {
         return this.#element
     }
     get document() {
-        return this.#iframe.contentDocument
+        return this.#loadedDocument
     }
     get contentPages() {
         return this.#contentPages
     }
+    hasLayoutSize(width, height) {
+        return this.#layout.width === width && this.#layout.height === height
+    }
     async load(src, data, afterLoad, beforeRender) {
+        if (this.#destroyed) return
         if (typeof src !== 'string') throw new Error(`${src} is not string`)
         return new Promise(resolve => {
-            this.#iframe.addEventListener('load', () => {
-                const doc = this.document
+            const finish = () => {
+                this.#iframe.removeEventListener('load', onLoad)
+                this.#cancelLoad = null
+                resolve()
+            }
+            const onLoad = () => {
+                if (this.#destroyed) return finish()
+                const doc = this.#iframe.contentDocument
+                this.#loadedDocument = doc
                 afterLoad?.(doc)
+                if (this.#destroyed) return
 
                 this.#iframe.setAttribute('aria-label', doc.title)
                 // it needs to be visible for Firefox to get computed style
@@ -437,8 +452,10 @@ class View {
                 // until the bug is fixed we can at least account for font load
                 this.fontReady = doc.fonts.ready.then(() => this.expand())
 
-                resolve()
-            }, { once: true })
+                finish()
+            }
+            this.#cancelLoad = finish
+            this.#iframe.addEventListener('load', onLoad, { once: true })
             if (data) {
                 this.#iframe.srcdoc = data
             } else {
@@ -828,8 +845,11 @@ class View {
             this.#overlayer.clearHole()
     }
     destroy() {
-        if (this.document?.body) this.#observer.unobserve(this.document.body)
+        this.#destroyed = true
+        this.#cancelLoad?.()
+        this.#observer.disconnect()
         this.destroyLoupe()
+        this.#loadedDocument = null
     }
 }
 
@@ -854,6 +874,9 @@ export class Paginator extends HTMLElement {
     #marginTop = 0
     #marginBottom = 0
     #anchor = 0 // anchor view to a fraction (0-1), Range, or Element
+    // Spread grid origin in container coordinates. A cold resume may start on
+    // an odd chapter-local column; retain that phase for every subsequent turn.
+    #pageOrigin = 0
     #justAnchored = false
     #locked = false // while true, prevent any further navigation
     #styles
@@ -863,6 +886,8 @@ export class Paginator extends HTMLElement {
     #scrollBounds
     #touchState
     #touchScrolled
+    #wheelState
+    #wheelTimer
     #lastVisibleRange
     #scrollLocked = false
     #isAnimating = false
@@ -870,6 +895,7 @@ export class Paginator extends HTMLElement {
     #fillPromise = null // tracks in-progress #fillVisibleArea for awaiting
     #stabilizing = false // true while #display is stabilizing layout
     #rendered = false // true after first #display completes
+    #destroyed = false
     constructor() {
         super()
         this.#root.innerHTML = `<style>
@@ -1190,7 +1216,12 @@ export class Paginator extends HTMLElement {
             onExpand: () => {
                 // Only the primary view's resize should adjust scroll;
                 // non-primary views (preloaded/adjacent) must not scroll
-                if (this.#filling || this.#stabilizing || this.scrolled) return
+                if (this.#filling || this.#stabilizing) return
+                // WebKit may finish iframe reflow after render() positioned the
+                // anchor. Correct that delayed layout while still anchored;
+                // ordinary Scroll expansion must not move a user's position.
+                if (this.scrolled && (!this.#justAnchored
+                    || Math.abs(this.containerPosition - this.#scrollBounds?.[0]) > 1)) return
                 if (this.#primaryIndex === index)
                     this.#scrollToAnchor(this.#anchor)
             },
@@ -1296,6 +1327,8 @@ export class Paginator extends HTMLElement {
     #beforeRender({ vertical, rtl }) {
         this.#vertical = vertical
         this.#rtl = rtl
+        // Leading-column alignment is only defined for horizontal LTR pages.
+        if (vertical || rtl || this.scrolled) this.#pageOrigin = 0
         this.#top.classList.toggle('vertical', vertical)
         this.#container.classList.toggle('vertical', vertical)
 
@@ -1395,7 +1428,7 @@ export class Paginator extends HTMLElement {
         // Scroll synchronously to prevent visible layout shift during resize.
         // RAF deferral is only needed for initial display and mode switches
         // (handled by #display), not for resize re-renders.
-        this.#scrollToAnchor(this.#anchor)
+        this.#scrollToAnchor(this.#anchor, 'anchor', false, true)
         this.#stabilizing = false
         this.dispatchEvent(new Event('stabilized'))
     }
@@ -1464,10 +1497,23 @@ export class Paginator extends HTMLElement {
         return this.#renderedStart + this.size
     }
     get #renderedPage() {
-        return Math.floor(((this.#renderedStart + this.#renderedEnd) / 2) / this.size)
+        return this.#pageAtOffset(this.#renderedStart)
+    }
+    #pageAtOffset(offset) {
+        if (this.#rtl || this.#vertical)
+            return Math.floor((offset + this.size / 2) / this.size)
+        // The leading partial spread precedes page zero on a shifted resume
+        // grid. Its midpoint can fall on the origin, but Next must still land
+        // at that origin rather than skip to the following full spread.
+        if (offset < this.#pageOrigin - 1) return -1
+        // A terminal half-spread is browser-clamped between grid positions.
+        // Its midpoint still identifies the requested final logical page.
+        return Math.floor((offset + this.size / 2 - this.#pageOrigin) / this.size + 0.01)
     }
     get #renderedPages() {
-        return Math.round(this.#renderedViewSize / this.size)
+        if (this.#rtl || this.#vertical)
+            return Math.round(this.#renderedViewSize / this.size)
+        return Math.ceil((this.#renderedViewSize - this.#pageOrigin) / this.size)
     }
     set containerPosition(newVal) {
         this.#container[this.scrollProp] = newVal
@@ -1484,6 +1530,34 @@ export class Paginator extends HTMLElement {
         const max = rtl ? offset + a : offset + b
         this.containerPosition = Math.max(min, Math.min(max,
             this.containerPosition + delta))
+    }
+
+    handleWheel(deltaX, deltaY) {
+        if (this.scrolled || this.#scrollLocked) return
+        const delta = Math.abs(deltaX) > Math.abs(deltaY) ? deltaX : deltaY
+        if (!delta) return
+        const dx = this.#vertical ? 0 : delta * (this.#rtl ? -1 : 1)
+        const dy = this.#vertical ? delta : 0
+        const now = performance.now()
+        const state = this.#wheelState ?? { dx: 0, dy: 0, startedAt: now }
+        state.dx += dx
+        state.dy += dy
+        this.#wheelState = state
+        this.scrollBy(dx, dy)
+        if (this.#wheelTimer) clearTimeout(this.#wheelTimer)
+        this.#wheelTimer = setTimeout(() => {
+            if (this.scrolled || !this.#wheelState) {
+                this.#wheelState = null
+                this.#wheelTimer = null
+                return
+            }
+            const { dx, dy, startedAt } = this.#wheelState
+            const dt = Math.max(1, performance.now() - startedAt)
+            const clamp = value => Math.max(-0.35, Math.min(0.35, value))
+            this.#wheelState = null
+            this.#wheelTimer = null
+            this.snap(clamp(dx / dt), clamp(dy / dt), dx, dy, dt)
+        }, 120)
     }
 
     // vx, vy: velocity at the end of the swipe (pixels per ms)
@@ -1505,8 +1579,10 @@ export class Paginator extends HTMLElement {
         const v =  snapping ? velocity : avgVelocity
         const d = v * (this.#rtl ? -size : size) * (orthogonal ? 1 : 0)
         const snapOffset = (isNaN(d) ? 0 : snapping ? d * 2 : d * 10)
-        const page = Math.floor(Math.max(min, Math.min(max, (start + end) / 2 + snapOffset)) / size)
-        const dir = page < 0 ? -1 : page >= pages ? 1 : null
+        const page = Math.floor((Math.max(min, Math.min(max, (start + end) / 2 + snapOffset)) - this.#pageOrigin) / size)
+        if (page < 0 && !this.#rtl && !this.#vertical)
+            return this.#turnPage(-1, undefined, Math.abs(offset))
+        const dir = page < 0 && start <= 0 ? -1 : page >= pages ? 1 : null
         const doGoTo = () => {
             if (!dir) return
             const sorted = this.#sortedViews
@@ -1613,7 +1689,7 @@ export class Paginator extends HTMLElement {
                 ? ({ top, bottom }) => ({ left: top, right: bottom })
                 : f => f
     }
-    async #scrollToRect(rect, reason) {
+    async #scrollToRect(rect, reason, alignStart = false) {
         if (this.scrolled) {
             // rect is in iframe-local coordinates; add view offset
             // to convert to container scroll coordinates
@@ -1626,7 +1702,13 @@ export class Paginator extends HTMLElement {
         const localOffset = this.#getRectMapper()(rect).left
         const viewOffset = this.#getViewOffset(this.#primaryIndex)
         const containerOffset = viewOffset + localOffset
-        return this.#scrollToPage(Math.floor(containerOffset / this.size + 0.01), reason)
+        if (alignStart && !this.#rtl && !this.#vertical) {
+            const columnSize = this.size / this.columnCount
+            const columnStart = viewOffset + Math.floor(localOffset / columnSize + 0.01) * columnSize
+            const phase = ((columnStart % this.size) + this.size) % this.size
+            this.#pageOrigin = phase < 1 || this.size - phase < 1 ? 0 : phase
+        }
+        return this.#scrollToPage(Math.floor((containerOffset - this.#pageOrigin) / this.size + 0.01), reason)
     }
     async #scrollTo(offset, reason, smooth) {
         const { size } = this
@@ -1662,13 +1744,16 @@ export class Paginator extends HTMLElement {
         }
     }
     async #scrollToPage(page, reason, smooth) {
-        const offset = this.size * (this.#rtl ? -page : page)
+        const position = this.#rtl || this.#vertical ? this.size * page
+            : Math.max(0, this.#pageOrigin + this.size * page)
+        const offset = this.#rtl ? -position : position
         return this.#scrollTo(offset, reason, smooth)
     }
     async scrollToAnchor(anchor, select, smooth) {
         return this.#scrollToAnchor(anchor, select ? 'selection' : 'navigation', smooth)
     }
-    async #scrollToAnchor(anchor, reason = 'anchor', smooth = false) {
+    async #scrollToAnchor(anchor, reason = 'anchor', smooth = false, alignStart = false) {
+        if (this.#destroyed) return
         this.#anchor = anchor
         const rects = uncollapse(anchor)?.getClientRects?.()
         // if anchor is an element or a range
@@ -1678,7 +1763,8 @@ export class Paginator extends HTMLElement {
             const rect = Array.from(rects)
                 .find(r => r.width > 0 && r.height > 0 && r.x >= 0 && r.y >= 0) || rects[0]
             if (!rect) return
-            await this.#scrollToRect(rect, reason)
+            await this.#scrollToRect(rect, reason, alignStart)
+            if (this.#destroyed) return
             // focus the element when navigating with keyboard or screen reader
             if (reason === 'navigation') {
                 let node = anchor.focus ? anchor : undefined
@@ -1714,8 +1800,8 @@ export class Paginator extends HTMLElement {
         if (!textPages) return
         // textPages is in column units; convert to spread page for scrolling
         const newColumn = Math.round(anchor * (textPages - 1))
-        const newSpreadPage = Math.floor(newColumn / this.columnCount)
-        await this.#scrollToPage(pagesBeforePrimary + newSpreadPage, reason, smooth)
+        const newSpreadPage = Math.floor(pagesBeforePrimary + newColumn / this.columnCount + 0.01)
+        await this.#scrollToPage(newSpreadPage, reason, smooth)
     }
     // Get the pixel offset of a view within the container
     #getViewOffset(index) {
@@ -1726,13 +1812,12 @@ export class Paginator extends HTMLElement {
         }
         return offset
     }
-    // Get number of full pages (spreads) before a given view.
-    // Uses floor so the view's first column is always on or after
-    // the returned page — never rounded past it. The 0.01 tolerance
-    // absorbs sub-pixel drift on fractional-DPR devices where
-    // getBoundingClientRect() accumulates ~0.0001px errors.
+    // View offset in spread units relative to the resume grid. Retain a
+    // fractional spread until combined with the target column: rounding the
+    // two offsets separately loses the column on an odd-column resume.
     #getPagesBeforeView(index) {
-        return Math.floor(this.#getViewOffset(index) / this.size + 0.01)
+        const pages = (this.#getViewOffset(index) - this.#pageOrigin) / this.size
+        return this.#rtl || this.#vertical ? Math.floor(pages + 0.01) : pages
     }
     #getVisibleRange() {
         const targetView = this.#primaryView
@@ -1816,6 +1901,7 @@ export class Paginator extends HTMLElement {
         }
     }
     #afterScroll(reason) {
+        if (this.#destroyed) return
         // In multi-view, detect which section is primary
         if (this.#views.size > 1 && reason !== 'anchor' && reason !== 'navigation') {
             this.#detectPrimaryView()
@@ -1880,7 +1966,8 @@ export class Paginator extends HTMLElement {
     async #display(promise) {
         this.#stabilizing = true
         this.#container.style.opacity = '0'
-        const { index, src, data, anchor, onLoad, select } = await promise
+        const { index, src, data, anchor, onLoad, select, alignStart } = await promise
+        if (this.#destroyed) return
         // Guard: if section load failed (catch returned {}), keep current view
         if (index === undefined) {
             this.#stabilizing = false
@@ -1905,6 +1992,7 @@ export class Paginator extends HTMLElement {
             }
             const beforeRender = this.#beforeRender.bind(this)
             await view.load(src, data, afterLoad, beforeRender)
+            if (this.#views.get(index) !== view) return
             this.dispatchEvent(new CustomEvent('create-overlayer', {
                 detail: {
                     doc: view.document, index,
@@ -1912,6 +2000,7 @@ export class Paginator extends HTMLElement {
                 },
             }))
         }
+        if (this.#destroyed) return
         // Pre-load previous section when needed:
         // - Short primary alignment (section shorter than one spread)
         // - Scrolled mode with anchor in top half — so the user can
@@ -1931,9 +2020,11 @@ export class Paginator extends HTMLElement {
             }
         }
         if (this.scrolled) await this.#ensureScrolledStartupFill()
+        if (this.#destroyed) return
         const resolvedAnchor = (typeof anchor === 'function'
             ? anchor(primaryView.document) : anchor) ?? 0
-        await this.scrollToAnchor(resolvedAnchor, select)
+        await this.#scrollToAnchor(resolvedAnchor, select ? 'selection' : 'navigation', false, alignStart)
+        if (this.#destroyed) return
         if (hasFocus) this.focusView()
         // Reveal content now that primary section is positioned
         this.#container.style.opacity = '1'
@@ -1956,7 +2047,9 @@ export class Paginator extends HTMLElement {
         if (!section || section.linear === 'no') return
         try {
             const src = await section.load()
+            if (this.#destroyed) return
             const data = await section.loadContent?.()
+            if (this.#destroyed) return
             const view = this.#createView(index)
             const afterLoad = doc => {
                 if (doc.head) {
@@ -1973,6 +2066,7 @@ export class Paginator extends HTMLElement {
             }
             const beforeRender = this.#beforeRender.bind(this)
             await view.load(src, data, afterLoad, beforeRender)
+            if (this.#views.get(index) !== view) return
             this.dispatchEvent(new CustomEvent('create-overlayer', {
                 detail: {
                     doc: view.document, index,
@@ -1980,6 +2074,7 @@ export class Paginator extends HTMLElement {
                 },
             }))
         } catch (e) {
+            if (this.#destroyed) return
             console.warn(e)
             console.warn(new Error(`Failed to load adjacent section ${index}`))
         }
@@ -2051,9 +2146,10 @@ export class Paginator extends HTMLElement {
         }
     }
     #canGoToIndex(index) {
-        return index >= 0 && index <= this.sections.length - 1
+        return !this.#destroyed && index >= 0 && index <= this.sections.length - 1
     }
-    async #goTo({ index, anchor, select }) {
+    async #goTo({ index, anchor, select, alignStart }) {
+        if (this.#destroyed) return
         if (this.#views.has(index)) {
             // View already loaded — reuse it without
             // clearing/reloading. Just change primary and scroll.
@@ -2076,14 +2172,18 @@ export class Paginator extends HTMLElement {
                     }
                 }
             }
+            if (this.#destroyed) return
             // In noContinuousScroll mode, destroy all non-primary views
             if (this.noContinuousScroll) {
                 for (const [i] of this.#views) {
                     if (i !== index) this.#destroyView(i)
                 }
             }
-            await this.scrollToAnchor((typeof anchor === 'function'
-                ? anchor(primaryView.document) : anchor) ?? 0, select)
+            const resolvedAnchor = (typeof anchor === 'function'
+                ? anchor(primaryView.document) : anchor) ?? 0
+            await this.#scrollToAnchor(resolvedAnchor,
+                select ? 'selection' : 'navigation', false, alignStart)
+            if (this.#destroyed) return
             this.#container.style.opacity = '1'
             if (hasFocus) this.focusView()
             // Load remaining adjacent sections progressively;
@@ -2110,9 +2210,11 @@ export class Paginator extends HTMLElement {
             }
             await this.#display(Promise.resolve(this.sections[index].load())
                 .then(async src => {
+                    if (this.#destroyed) return {}
                     const data = await this.sections[index].loadContent?.()
-                    return { index, src, data, anchor, onLoad, select }
+                    return { index, src, data, anchor, onLoad, select, alignStart }
                 }).catch(e => {
+                    if (this.#destroyed) return {}
                     console.warn(e)
                     console.warn(new Error(`Failed to load section ${index}`))
                     return {}
@@ -2124,17 +2226,18 @@ export class Paginator extends HTMLElement {
         const resolved = await target
         if (this.#canGoToIndex(resolved.index)) return this.#goTo(resolved)
     }
-    #scrollPrev(distance) {
+    #scrollPrev(distance, settledStart = this.#renderedStart) {
         if (this.#views.size === 0) return true
         if (this.scrolled) {
             if (this.#renderedStart > 0) return this.#scrollTo(
                 Math.max(0, this.#renderedStart - (distance ?? this.size)), null, true)
             return !this.atStart
         }
-        if (this.atStart) return
-        const page = this.#renderedPage - 1
+        if (this.atStart && (this.#rtl || this.#vertical || settledStart <= 1)) return
+        const page = this.#pageAtOffset(settledStart) - 1
         // Out of range — skip animation, go straight to previous section
-        if (page < 0) return true
+        if (page < 0) return !this.#rtl && !this.#vertical && settledStart > 0
+            ? this.#scrollTo(0, 'page', true) : true
         return this.#scrollToPage(page, 'page', true)
     }
     #scrollNext(distance) {
@@ -2155,24 +2258,59 @@ export class Paginator extends HTMLElement {
         const sorted = this.#sortedViews
         const firstIndex = sorted[0]?.[0] ?? this.#primaryIndex
         if (this.scrolled) return this.#adjacentIndex(-1, firstIndex) == null && this.#renderedStart <= 0
-        return this.#adjacentIndex(-1, firstIndex) == null && this.#renderedPage <= 0
+        if (this.#rtl || this.#vertical) return this.#adjacentIndex(-1, firstIndex) == null && this.#renderedPage <= 0
+        return this.#adjacentIndex(-1, firstIndex) == null && this.#renderedStart <= 1
     }
     get atEnd() {
         const sorted = this.#sortedViews
         const lastIndex = sorted[sorted.length - 1]?.[0] ?? this.#primaryIndex
         if (this.scrolled) return this.#adjacentIndex(1, lastIndex) == null && this.#renderedViewSize - this.#renderedEnd <= 2
-        return this.#adjacentIndex(1, lastIndex) == null && this.#renderedPage >= this.#renderedPages - 1
+        if (this.#rtl || this.#vertical) return this.#adjacentIndex(1, lastIndex) == null && this.#renderedPage >= this.#renderedPages - 1
+        return this.#adjacentIndex(1, lastIndex) == null && this.#renderedEnd >= this.#renderedViewSize - 1
     }
     #adjacentIndex(dir, fromIndex) {
         if (fromIndex === undefined) fromIndex = this.#primaryIndex
         for (let index = fromIndex + dir; this.#canGoToIndex(index); index += dir)
             if (this.sections[index]?.linear !== 'no') return index
     }
-    async #turnPage(dir, distance) {
+    async #turnPage(dir, distance, settledStart = this.#renderedStart) {
         if (this.#locked) return
         this.#locked = true
+        const view = this.#primaryView
+        const { width, height } = this.#container.getBoundingClientRect()
+        // A key can arrive before ResizeObserver delivers a pane resize.
+        // Turn from the current layout so delayed reflow cannot undo it.
+        if (view && !view.hasLayoutSize(width, height)) {
+            this.render()
+            settledStart = this.#renderedStart
+        }
         const prev = dir === -1
-        const shouldGo = await (prev ? this.#scrollPrev(distance) : this.#scrollNext(distance))
+        // A restored odd-column spread may extend before the first loaded
+        // chapter on its next backward turn. Load that preceding content before
+        // turning instead of clamping to zero and repeating half a spread.
+        if (prev && !this.scrolled && !this.#rtl && !this.#vertical
+            && this.#pageOrigin > 0 && settledStart < this.size) {
+            if (this.#fillPromise) await this.#fillPromise
+            const firstIndex = this.#sortedViews[0]?.[0]
+            const previousIndex = this.#adjacentIndex(-1, firstIndex)
+            if (previousIndex != null) {
+                const start = this.#renderedStart
+                const before = this.#getViewOffset(this.#primaryIndex)
+                this.#filling = true
+                try {
+                    await this.#loadAdjacentSection(previousIndex)
+                    const added = this.#getViewOffset(this.#primaryIndex) - before
+                    this.#pageOrigin = (this.#pageOrigin + added) % this.size
+                    settledStart += added
+                    // Preserve the dragged visual position while measuring the
+                    // turn from the settled pre-gesture position, just like a button.
+                    await this.#scrollTo(start + added, 'anchor')
+                } finally {
+                    this.#filling = false
+                }
+            }
+        }
+        const shouldGo = await (prev ? this.#scrollPrev(distance, settledStart) : this.#scrollNext(distance))
         if (shouldGo) {
             // Wait for any in-progress background pre-loading to complete —
             // it may already be loading the section we need, so awaiting
@@ -2262,7 +2400,9 @@ export class Paginator extends HTMLElement {
         this.#primaryView?.destroyLoupe()
     }
     destroy() {
-        this.#observer.unobserve(this)
+        this.#destroyed = true
+        if (this.#wheelTimer) clearTimeout(this.#wheelTimer)
+        this.#observer.disconnect()
         this.#destroyAllViews()
         this.#mediaQuery.removeEventListener('change', this.#mediaQueryListener)
     }

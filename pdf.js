@@ -1,5 +1,9 @@
 const pdfjsPath = path => `/vendor/pdfjs/${path}`
 
+import { checkPreviewSignal, PreviewResources, validatePreviewRequest, fitPreview, canvasPreview } from './page-preview.js'
+import { setupPDFSelection } from './pdf-selection.js'
+import { needsPDFRecognition, prepareRecognizedPDFText } from './pdf-text-geometry.js'
+import { createRecognizedPDFTextLayer } from './pdf-text-layer-geometry.js'
 import '@pdfjs/pdf.min.mjs'
 const pdfjsLib = globalThis.pdfjsLib
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfjsPath('pdf.worker.min.mjs')
@@ -13,6 +17,7 @@ let annotationLayerBuilderCSS = null
 const activeRenderTasks = new WeakMap()
 // Generation counter per document to detect stale renders after async gaps
 const renderGenerations = new WeakMap()
+const textLayers = new WeakMap()
 
 // Set up panning and selection event handlers once per iframe document
 const setupPanningEvents = (doc) => {
@@ -60,9 +65,11 @@ const setupPanningEvents = (doc) => {
         const elementUnderCursor = doc.elementFromPoint(e.clientX, e.clientY)
         const hasTextUnderneath = elementUnderCursor &&
                              (elementUnderCursor.tagName === 'SPAN' || elementUnderCursor.tagName === 'P') &&
-                             elementUnderCursor.textContent.trim().length > 0
+                             (elementUnderCursor.textContent.trim().length > 0 ||
+                              elementUnderCursor.hasAttribute('data-pdf-text-space'))
 
         if (!hasTextUnderneath && !hasTextSelection) {
+            e.preventDefault()
             isPanning = true
             startX = e.screenX
             startY = e.screenY
@@ -130,7 +137,7 @@ const setupPanningEvents = (doc) => {
     container.style.cursor = 'grab'
 }
 
-const render = async (page, doc, zoom, pageColors) => {
+const render = async (page, doc, zoom, pageColors, prepareText) => {
     if (!doc) return
 
     // Increment generation to invalidate any in-progress render for this doc
@@ -197,17 +204,65 @@ const render = async (page, doc, zoom, pageColors) => {
     }
     canvasElement.replaceChildren(doc.adoptNode(canvas))
 
-    // Clear text layer before re-rendering to prevent DOM accumulation
     const container = doc.querySelector('.textLayer')
-    container.replaceChildren()
-    const textLayer = new pdfjsLib.TextLayer({
-        textContentSource: await page.streamTextContent(),
-        container, viewport,
-    })
-    await textLayer.render()
-
-    // Bail out if superseded after async text layer render
-    if (renderGenerations.get(doc) !== generation) return
+    let state = textLayers.get(doc)
+    if (!state) {
+        const controller = new AbortController()
+        state = { viewport, controller, layer: null, selection: null }
+        textLayers.set(doc, state)
+        doc.defaultView.addEventListener('pagehide', () => {
+            controller.abort()
+            state.selection?.destroy()
+        }, { once: true })
+        const status = doc.createElement('div')
+        status.dataset.pdfTextStatus = ''
+        status.setAttribute('role', 'status')
+        status.setAttribute('aria-live', 'polite')
+        Object.assign(status.style, { position: 'absolute', zIndex: '5',
+            top: `${12 * devicePixelRatio}px`, left: `${12 * devicePixelRatio}px`,
+            padding: `${6 * devicePixelRatio}px`, borderRadius: `${4 * devicePixelRatio}px`,
+            background: 'Canvas', color: 'CanvasText', font: `${14 * devicePixelRatio}px sans-serif` })
+        const start = async () => {
+            status.remove()
+            container.setAttribute('aria-busy', 'true')
+            try {
+                const model = await prepareText('visible', controller.signal)
+                if (controller.signal.aborted || !doc.defaultView) return
+                if (model.kind === 'recognized') {
+                    state.layer = createRecognizedPDFTextLayer(container, model)
+                } else {
+                    state.layer = new pdfjsLib.TextLayer({
+                        textContentSource: model.content, container, viewport: state.viewport,
+                    })
+                    await state.layer.render()
+                }
+                if (controller.signal.aborted || !doc.defaultView) return
+                state.layer.update({ viewport: state.viewport })
+                container.removeAttribute('aria-busy')
+                const end = doc.createElement('div')
+                end.className = 'endOfContent'
+                container.append(end)
+                state.selection = setupPDFSelection(doc)
+                setupPanningEvents(doc)
+                doc.dispatchEvent(new CustomEvent('pdf-text-ready'))
+            } catch (error) {
+                if (controller.signal.aborted || !doc.defaultView) return
+                container.removeAttribute('aria-busy')
+                status.textContent = 'Text could not be prepared. '
+                const retry = doc.createElement('button')
+                retry.type = 'button'
+                retry.textContent = 'Retry'
+                retry.onclick = () => void start()
+                status.append(retry)
+                doc.body.append(status)
+            }
+        }
+        void start()
+    } else {
+        state.viewport = viewport
+        state.layer?.update({ viewport })
+        state.selection?.update()
+    }
 
     // hide "offscreen" canvases appended to document when rendering text layer
     // https://github.com/mozilla/pdf.js/blob/642b9a5ae67ef642b9a8808fd9efd447e8c350e2/web/pdf_viewer.css#L51-L58
@@ -220,15 +275,6 @@ const render = async (page, doc, zoom, pageColors) => {
             height: '0',
             display: 'none',
         })
-
-    // fix text selection
-    // https://github.com/mozilla/pdf.js/blob/642b9a5ae67ef642b9a8808fd9efd447e8c350e2/web/text_layer_builder.js#L105-L107
-    const endOfContent = document.createElement('div')
-    endOfContent.className = 'endOfContent'
-    container.append(endOfContent)
-
-    // Set up panning/selection event handlers once per document
-    setupPanningEvents(doc)
 
     // Clear annotation layer before re-rendering to prevent DOM accumulation
     const div = doc.querySelector('.annotationLayer')
@@ -243,7 +289,7 @@ const render = async (page, doc, zoom, pageColors) => {
     })
 }
 
-const renderPage = async (page, getImageBlob) => {
+const renderPage = async (page, getImageBlob, prepareText) => {
     const viewport = page.getViewport({ scale: 1 })
     if (getImageBlob) {
         const canvas = document.createElement('canvas')
@@ -284,7 +330,7 @@ const renderPage = async (page, getImageBlob) => {
         <div class="annotationLayer"></div>
     `
     const src = URL.createObjectURL(new Blob([data], { type: 'text/html' }))
-    const onZoom = ({ doc, scale, pageColors }) => render(page, doc, scale, pageColors)
+    const onZoom = ({ doc, scale, pageColors }) => render(page, doc, scale, pageColors, prepareText)
     return { src, data, onZoom }
 }
 
@@ -315,8 +361,12 @@ const makeTOCItem = async (item, pdf) => {
 }
 
 const MAX_CACHED_PAGES = 8
+const checkAbortSignal = signal => {
+    if (signal.aborted) throw signal.reason ?? new DOMException('Aborted', 'AbortError')
+}
 
 export const makePDF = async file => {
+    const previews = new PreviewResources()
     const transport = new pdfjsLib.PDFDataRangeTransport(file.size, [])
     transport.requestDataRange = (begin, end) => {
         file.slice(begin, end).arrayBuffer().then(chunk => {
@@ -359,6 +409,115 @@ export const makePDF = async file => {
 
     const cache = new Map()
     const pageCache = new Map()
+    const preparedPages = new Map()
+    const pinnedPages = new Map()
+    const pageMetadata = new Map()
+    const lifetime = new AbortController()
+    let recognitionSource
+    book.configureTextRecognition = source => {
+        if (recognitionSource === source) return
+        recognitionSource?.dispose()
+        recognitionSource = source
+    }
+    const remember = (map, index, value) => {
+        map.delete(index)
+        map.set(index, value)
+        while (map.size > MAX_CACHED_PAGES) map.delete(map.keys().next().value)
+        return value
+    }
+    const publishPreparedText = (index, model, priority, signal) => {
+        const pinned = pinnedPages.get(index)
+        const canonical = pinned?.model ?? preparedPages.get(index) ?? model
+        remember(preparedPages, index, canonical)
+        if (priority === 'visible') {
+            const entry = pinned ?? { model: canonical, signals: new Set() }
+            pinnedPages.set(index, entry)
+            if (!entry.signals.has(signal)) {
+                entry.signals.add(signal)
+                signal.addEventListener('abort', () => {
+                    entry.signals.delete(signal)
+                    if (!entry.signals.size && pinnedPages.get(index) === entry)
+                        pinnedPages.delete(index)
+                }, { once: true })
+            }
+        }
+        return canonical
+    }
+    const preparePageText = async (index, priority, callerSignal) => {
+        const controller = new AbortController()
+        const signal = controller.signal
+        const abort = () => controller.abort(callerSignal.reason ?? lifetime.signal.reason)
+        callerSignal.addEventListener('abort', abort, { once: true })
+        lifetime.signal.addEventListener('abort', abort, { once: true })
+        if (callerSignal.aborted || lifetime.signal.aborted) abort()
+        try {
+            checkAbortSignal(signal)
+            const ready = pinnedPages.get(index)?.model ?? preparedPages.get(index)
+            if (ready) return publishPreparedText(index, ready, priority, callerSignal)
+            let metadata = pageMetadata.get(index)
+            if (!metadata) {
+                metadata = (async () => {
+                    const page = await getPage(index)
+                    const [content, operators] = await Promise.all([
+                        page.getTextContent(), page.getOperatorList(),
+                    ])
+                    const viewport = page.getViewport({ scale: 1 })
+                    return { page, content, viewport,
+                        recognize: needsPDFRecognition(content, operators, viewport, pdfjsLib.OPS) }
+                })()
+                remember(pageMetadata, index, metadata)
+                metadata.catch(() => {
+                    if (pageMetadata.get(index) === metadata) pageMetadata.delete(index)
+                })
+            }
+            const { page, content, viewport, recognize } = await metadata
+            checkAbortSignal(signal)
+            if (!recognize) return publishPreparedText(index,
+                Object.freeze({ kind: 'embedded', content }), priority, callerSignal)
+            if (!recognitionSource) throw new Error('Text recognition is unavailable')
+            // Aim for 300 dpi, bound both the longest edge and total raster memory.
+            const scale = Math.min(300 / 72, 2800 / Math.max(viewport.width, viewport.height),
+                Math.sqrt(6_000_000 / (viewport.width * viewport.height)))
+            const recognized = await recognitionSource.get({
+                pageIndex: index, priority, signal,
+                key: JSON.stringify({ crop: page.view, rotation: viewport.rotation,
+                    width: viewport.width, height: viewport.height, raster: '300dpi-2800-6mp-8mib-v2' }),
+                rasterize: async recognitionSignal => {
+                    checkAbortSignal(recognitionSignal)
+                    const canvas = document.createElement('canvas')
+                    const rasterViewport = page.getViewport({ scale })
+                    canvas.width = Math.ceil(rasterViewport.width)
+                    canvas.height = Math.ceil(rasterViewport.height)
+                    const task = page.render({ canvasContext: canvas.getContext('2d'), viewport: rasterViewport })
+                    const cancel = () => task.cancel()
+                    recognitionSignal.addEventListener('abort', cancel, { once: true })
+                    try {
+                        await task.promise
+                        checkAbortSignal(recognitionSignal)
+                        let blob = await new Promise(resolve => canvas.toBlob(resolve))
+                        for (const quality of [0.92, 0.8]) {
+                            checkAbortSignal(recognitionSignal)
+                            if (blob && blob.size <= 8 * 1024 * 1024) break
+                            blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/jpeg', quality))
+                        }
+                        checkAbortSignal(recognitionSignal)
+                        if (!blob) throw new Error('Could not prepare the page image')
+                        if (blob.size > 8 * 1024 * 1024) throw new Error('Page image exceeds the recognition size limit')
+                        return blob
+                    } finally {
+                        recognitionSignal.removeEventListener('abort', cancel)
+                        canvas.width = canvas.height = 0
+                    }
+                },
+            })
+            checkAbortSignal(signal)
+            const previous = pinnedPages.get(index)?.model ?? preparedPages.get(index)
+            return publishPreparedText(index, previous ?? prepareRecognizedPDFText(recognized), priority, callerSignal)
+        } finally {
+            callerSignal.removeEventListener('abort', abort)
+            lifetime.signal.removeEventListener('abort', abort)
+        }
+    }
     const getPage = async (i) => {
         const cached = pageCache.get(i)
         if (cached) {
@@ -390,7 +549,7 @@ export const makePDF = async file => {
                 cache.set(i, cached)
                 return cached
             }
-            const url = await renderPage(await getPage(i))
+            const url = await renderPage(await getPage(i), false, (priority, signal) => preparePageText(i, priority, signal))
             cache.set(i, url)
 
             // Evict oldest render results when over limit
@@ -403,7 +562,8 @@ export const makePDF = async file => {
 
             return url
         },
-        createDocument: async () => {
+        createDocument: async ({ signal = lifetime.signal } = {}) => {
+            const model = await preparePageText(i, 'search', signal)
             const page = await getPage(i)
             const doc = document.implementation.createHTMLDocument('')
 
@@ -419,18 +579,14 @@ export const makePDF = async file => {
             annotationLayer.className = 'annotationLayer'
             doc.body.appendChild(annotationLayer)
 
-            // TextLayer requires canvas 2d context for font metrics;
-            // fall back to manual span construction when unavailable
-            const probe = doc.createElement('canvas')
-            if (probe.getContext?.('2d')) {
-                const textLayerInstance = new pdfjsLib.TextLayer({
-                    textContentSource: await page.streamTextContent(),
-                    container: textLayer, viewport: page.getViewport({ scale: 1 }),
-                })
-                await textLayerInstance.render()
-            } else {
-                const content = await page.getTextContent()
-                for (const item of content.items) {
+            if (model.kind === 'recognized') createRecognizedPDFTextLayer(textLayer, model)
+            else {
+                const probe = doc.createElement('canvas')
+                if (probe.getContext?.('2d')) {
+                    const layer = new pdfjsLib.TextLayer({ textContentSource: model.content,
+                        container: textLayer, viewport: page.getViewport({ scale: 1 }) })
+                    await layer.render()
+                } else for (const item of model.content.items) {
                     if (item.str) {
                         const span = doc.createElement('span')
                         span.textContent = item.str
@@ -465,7 +621,48 @@ export const makePDF = async file => {
     }
     book.getTOCFragment = doc => doc.documentElement
     book.getCover = async () => renderPage(await pdf.getPage(1), true)
+    book.getPagePreview = async (index, options) => {
+        const bounds = validatePreviewRequest(index, pdf.numPages, options)
+        const scope = previews.open(options.signal)
+        const canvas = document.createElement('canvas')
+        let page
+        let task
+        const cancel = () => task?.cancel()
+        scope.signal.addEventListener('abort', cancel, { once: true })
+        try {
+            // Preview requests must not evict or clean up pages used by the reader.
+            page = await pdf.getPage(index + 1)
+            checkPreviewSignal(scope.signal)
+            const original = page.getViewport({ scale: 1 })
+            const { width, height, scale } = fitPreview(original.width, original.height, bounds)
+            canvas.width = width
+            canvas.height = height
+            task = page.render({
+                canvasContext: canvas.getContext('2d'),
+                viewport: page.getViewport({ scale }),
+            })
+            await task.promise
+            return await canvasPreview(canvas, scope)
+        } catch (error) {
+            const aborted = scope.signal.aborted
+            scope.release()
+            if (aborted) checkPreviewSignal(scope.signal)
+            throw error
+        } finally {
+            scope.signal.removeEventListener('abort', cancel)
+            canvas.width = 0
+            canvas.height = 0
+            // PDF.js defers cleanup until concurrent render tasks have completed.
+            if (!pageCache.has(index)) page?.cleanup()
+        }
+    }
     book.destroy = () => {
+        lifetime.abort()
+        preparedPages.clear()
+        pinnedPages.clear()
+        pageMetadata.clear()
+        recognitionSource?.dispose()
+        previews.destroy()
         // Clean up all cached canvases and revoke blob URLs
         for (const [, entry] of cache) {
             if (entry?.src) URL.revokeObjectURL(entry.src)
