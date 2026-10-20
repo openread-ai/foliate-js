@@ -348,6 +348,8 @@ class View {
     #element = document.createElement('div')
     #iframe = document.createElement('iframe')
     #loadedDocument = null
+    #destroyed = false
+    #cancelLoad
     #contentRange = document.createRange()
     #overlayer
     #vertical = false
@@ -395,12 +397,20 @@ class View {
         return this.#contentPages
     }
     async load(src, data, afterLoad, beforeRender) {
+        if (this.#destroyed) return
         if (typeof src !== 'string') throw new Error(`${src} is not string`)
         return new Promise(resolve => {
-            this.#iframe.addEventListener('load', () => {
+            const finish = () => {
+                this.#iframe.removeEventListener('load', onLoad)
+                this.#cancelLoad = null
+                resolve()
+            }
+            const onLoad = () => {
+                if (this.#destroyed) return finish()
                 const doc = this.#iframe.contentDocument
                 this.#loadedDocument = doc
                 afterLoad?.(doc)
+                if (this.#destroyed) return
 
                 this.#iframe.setAttribute('aria-label', doc.title)
                 // it needs to be visible for Firefox to get computed style
@@ -439,8 +449,10 @@ class View {
                 // until the bug is fixed we can at least account for font load
                 this.fontReady = doc.fonts.ready.then(() => this.expand())
 
-                resolve()
-            }, { once: true })
+                finish()
+            }
+            this.#cancelLoad = finish
+            this.#iframe.addEventListener('load', onLoad, { once: true })
             if (data) {
                 this.#iframe.srcdoc = data
             } else {
@@ -830,7 +842,9 @@ class View {
             this.#overlayer.clearHole()
     }
     destroy() {
-        if (this.document?.body) this.#observer.unobserve(this.document.body)
+        this.#destroyed = true
+        this.#cancelLoad?.()
+        this.#observer.disconnect()
         this.destroyLoupe()
         this.#loadedDocument = null
     }
@@ -878,6 +892,7 @@ export class Paginator extends HTMLElement {
     #fillPromise = null // tracks in-progress #fillVisibleArea for awaiting
     #stabilizing = false // true while #display is stabilizing layout
     #rendered = false // true after first #display completes
+    #destroyed = false
     constructor() {
         super()
         this.#root.innerHTML = `<style>
@@ -1735,6 +1750,7 @@ export class Paginator extends HTMLElement {
         return this.#scrollToAnchor(anchor, select ? 'selection' : 'navigation', smooth)
     }
     async #scrollToAnchor(anchor, reason = 'anchor', smooth = false, alignStart = false) {
+        if (this.#destroyed) return
         this.#anchor = anchor
         const rects = uncollapse(anchor)?.getClientRects?.()
         // if anchor is an element or a range
@@ -1745,6 +1761,7 @@ export class Paginator extends HTMLElement {
                 .find(r => r.width > 0 && r.height > 0 && r.x >= 0 && r.y >= 0) || rects[0]
             if (!rect) return
             await this.#scrollToRect(rect, reason, alignStart)
+            if (this.#destroyed) return
             // focus the element when navigating with keyboard or screen reader
             if (reason === 'navigation') {
                 let node = anchor.focus ? anchor : undefined
@@ -1881,6 +1898,7 @@ export class Paginator extends HTMLElement {
         }
     }
     #afterScroll(reason) {
+        if (this.#destroyed) return
         // In multi-view, detect which section is primary
         if (this.#views.size > 1 && reason !== 'anchor' && reason !== 'navigation') {
             this.#detectPrimaryView()
@@ -1946,6 +1964,7 @@ export class Paginator extends HTMLElement {
         this.#stabilizing = true
         this.#container.style.opacity = '0'
         const { index, src, data, anchor, onLoad, select, alignStart } = await promise
+        if (this.#destroyed) return
         // Guard: if section load failed (catch returned {}), keep current view
         if (index === undefined) {
             this.#stabilizing = false
@@ -1970,6 +1989,7 @@ export class Paginator extends HTMLElement {
             }
             const beforeRender = this.#beforeRender.bind(this)
             await view.load(src, data, afterLoad, beforeRender)
+            if (this.#views.get(index) !== view) return
             this.dispatchEvent(new CustomEvent('create-overlayer', {
                 detail: {
                     doc: view.document, index,
@@ -1977,6 +1997,7 @@ export class Paginator extends HTMLElement {
                 },
             }))
         }
+        if (this.#destroyed) return
         // Pre-load previous section when needed:
         // - Short primary alignment (section shorter than one spread)
         // - Scrolled mode with anchor in top half — so the user can
@@ -1996,9 +2017,11 @@ export class Paginator extends HTMLElement {
             }
         }
         if (this.scrolled) await this.#ensureScrolledStartupFill()
+        if (this.#destroyed) return
         const resolvedAnchor = (typeof anchor === 'function'
             ? anchor(primaryView.document) : anchor) ?? 0
         await this.#scrollToAnchor(resolvedAnchor, select ? 'selection' : 'navigation', false, alignStart)
+        if (this.#destroyed) return
         if (hasFocus) this.focusView()
         // Reveal content now that primary section is positioned
         this.#container.style.opacity = '1'
@@ -2021,7 +2044,9 @@ export class Paginator extends HTMLElement {
         if (!section || section.linear === 'no') return
         try {
             const src = await section.load()
+            if (this.#destroyed) return
             const data = await section.loadContent?.()
+            if (this.#destroyed) return
             const view = this.#createView(index)
             const afterLoad = doc => {
                 if (doc.head) {
@@ -2038,6 +2063,7 @@ export class Paginator extends HTMLElement {
             }
             const beforeRender = this.#beforeRender.bind(this)
             await view.load(src, data, afterLoad, beforeRender)
+            if (this.#views.get(index) !== view) return
             this.dispatchEvent(new CustomEvent('create-overlayer', {
                 detail: {
                     doc: view.document, index,
@@ -2045,6 +2071,7 @@ export class Paginator extends HTMLElement {
                 },
             }))
         } catch (e) {
+            if (this.#destroyed) return
             console.warn(e)
             console.warn(new Error(`Failed to load adjacent section ${index}`))
         }
@@ -2116,9 +2143,10 @@ export class Paginator extends HTMLElement {
         }
     }
     #canGoToIndex(index) {
-        return index >= 0 && index <= this.sections.length - 1
+        return !this.#destroyed && index >= 0 && index <= this.sections.length - 1
     }
     async #goTo({ index, anchor, select, alignStart }) {
+        if (this.#destroyed) return
         if (this.#views.has(index)) {
             // View already loaded — reuse it without
             // clearing/reloading. Just change primary and scroll.
@@ -2141,6 +2169,7 @@ export class Paginator extends HTMLElement {
                     }
                 }
             }
+            if (this.#destroyed) return
             // In noContinuousScroll mode, destroy all non-primary views
             if (this.noContinuousScroll) {
                 for (const [i] of this.#views) {
@@ -2151,6 +2180,7 @@ export class Paginator extends HTMLElement {
                 ? anchor(primaryView.document) : anchor) ?? 0
             await this.#scrollToAnchor(resolvedAnchor,
                 select ? 'selection' : 'navigation', false, alignStart)
+            if (this.#destroyed) return
             this.#container.style.opacity = '1'
             if (hasFocus) this.focusView()
             // Load remaining adjacent sections progressively;
@@ -2177,9 +2207,11 @@ export class Paginator extends HTMLElement {
             }
             await this.#display(Promise.resolve(this.sections[index].load())
                 .then(async src => {
+                    if (this.#destroyed) return {}
                     const data = await this.sections[index].loadContent?.()
                     return { index, src, data, anchor, onLoad, select, alignStart }
                 }).catch(e => {
+                    if (this.#destroyed) return {}
                     console.warn(e)
                     console.warn(new Error(`Failed to load section ${index}`))
                     return {}
@@ -2357,8 +2389,9 @@ export class Paginator extends HTMLElement {
         this.#primaryView?.destroyLoupe()
     }
     destroy() {
+        this.#destroyed = true
         if (this.#wheelTimer) clearTimeout(this.#wheelTimer)
-        this.#observer.unobserve(this)
+        this.#observer.disconnect()
         this.#destroyAllViews()
         this.#mediaQuery.removeEventListener('change', this.#mediaQueryListener)
     }
