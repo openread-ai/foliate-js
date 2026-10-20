@@ -396,6 +396,9 @@ class View {
     get contentPages() {
         return this.#contentPages
     }
+    hasLayoutSize(width, height) {
+        return this.#layout.width === width && this.#layout.height === height
+    }
     async load(src, data, afterLoad, beforeRender) {
         if (this.#destroyed) return
         if (typeof src !== 'string') throw new Error(`${src} is not string`)
@@ -2273,6 +2276,14 @@ export class Paginator extends HTMLElement {
     async #turnPage(dir, distance, settledStart = this.#renderedStart) {
         if (this.#locked) return
         this.#locked = true
+        const view = this.#primaryView
+        const { width, height } = this.#container.getBoundingClientRect()
+        // A key can arrive before ResizeObserver delivers a pane resize.
+        // Turn from the current layout so delayed reflow cannot undo it.
+        if (view && !view.hasLayoutSize(width, height)) {
+            this.render()
+            settledStart = this.#renderedStart
+        }
         const prev = dir === -1
         // A restored odd-column spread may extend before the first loaded
         // chapter on its next backward turn. Load that preceding content before
