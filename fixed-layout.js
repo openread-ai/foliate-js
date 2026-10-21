@@ -734,6 +734,9 @@ export class FixedLayout extends HTMLElement {
         return position > 0 ? this.#scrollPages.length - 1 : 0
     }
     #reportScrollLocation(reason = 'scroll') {
+        if (reason === 'scroll' && this.#scrollViewport
+            && (this.#scrollViewport.width !== this.clientWidth
+                || this.#scrollViewport.height !== this.clientHeight)) return
         const index = this.#getScrollIndex()
         if (index < 0) return
         this.#scrollCurrentIndex = index
