@@ -1292,6 +1292,9 @@ export class Paginator extends HTMLElement {
         const columnSize = this.size / cc
         const sorted = this.#sortedViews
 
+        // Paginated backgrounds belong to the columns, not the scrolled views.
+        for (const [, view] of sorted) view.element.style.background = ''
+        this.#background.style.background = ''
         this.#background.innerHTML = ''
         this.#background.style.display = 'grid'
         this.#background.style.gridTemplateColumns = `repeat(${cc}, 1fr)`
