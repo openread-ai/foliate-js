@@ -341,10 +341,12 @@ export class FixedLayout extends HTMLElement {
         if (overlayer) {
             Object.assign(overlayer.element.style, {
                 position: 'absolute',
-                top: '0',
-                left: '0',
-                width: `${frame.width * scale}px`,
-                height: `${frame.height * scale}px`,
+                top: `${frame.iframe.offsetTop}px`,
+                left: `${frame.iframe.offsetLeft}px`,
+                width: `${frame.iframe.clientWidth}px`,
+                height: `${frame.iframe.clientHeight}px`,
+                transform: frame.iframe.style.transform,
+                transformOrigin: frame.iframe.style.transformOrigin,
             })
             overlayer.redraw()
         }
