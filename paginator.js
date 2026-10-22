@@ -1223,7 +1223,7 @@ export class Paginator extends HTMLElement {
                 if (this.scrolled && (!this.#justAnchored
                     || Math.abs(this.containerPosition - this.#scrollBounds?.[0]) > 1)) return
                 if (this.#primaryIndex === index)
-                    this.#scrollToAnchor(this.#anchor)
+                    this.#scrollToAnchor(this.#anchor, 'reflow')
             },
         })
         this.#views.set(index, view)
@@ -1431,7 +1431,7 @@ export class Paginator extends HTMLElement {
         // Scroll synchronously to prevent visible layout shift during resize.
         // RAF deferral is only needed for initial display and mode switches
         // (handled by #display), not for resize re-renders.
-        this.#scrollToAnchor(this.#anchor, 'anchor', false, true)
+        this.#scrollToAnchor(this.#anchor, 'reflow', false, true)
         this.#stabilizing = false
         this.dispatchEvent(new Event('stabilized'))
     }
@@ -1906,14 +1906,14 @@ export class Paginator extends HTMLElement {
     #afterScroll(reason) {
         if (this.#destroyed) return
         // In multi-view, detect which section is primary
-        if (this.#views.size > 1 && reason !== 'anchor' && reason !== 'navigation') {
+        if (this.#views.size > 1 && reason !== 'anchor' && reason !== 'reflow' && reason !== 'navigation') {
             this.#detectPrimaryView()
         }
         const { range, index: visibleIndex } = this.#getVisibleRange() || {}
         if (!range) return
         this.#lastVisibleRange = range
         // don't set new anchor if relocation was to scroll to anchor
-        if (reason !== 'selection' && reason !== 'navigation' && reason !== 'anchor')
+        if (reason !== 'selection' && reason !== 'navigation' && reason !== 'anchor' && reason !== 'reflow')
             this.#anchor = range
         else this.#justAnchored = true
 
@@ -2127,7 +2127,7 @@ export class Paginator extends HTMLElement {
                 await this.#loadAdjacentSection(nextIdx)
                 if (!this.#views.has(nextIdx)) break
             }
-            if (reanchor) this.#scrollToAnchor(this.#anchor)
+            if (reanchor) this.#scrollToAnchor(this.#anchor, 'reflow')
         } finally {
             this.#filling = false
         }
