@@ -1121,6 +1121,8 @@ ${doc.querySelector('parsererror').innerText}`)
                 console.warn(`Could not find item with ID "${idref}" in manifest`)
                 return null
             }
+            if (!isExternal(item.href) && !this.entries.has(item.href))
+                throw new Error(`Missing EPUB content resource: ${item.href}`)
             return {
                 id: item.href,
                 load: () => this.#loader.loadItem(item),
