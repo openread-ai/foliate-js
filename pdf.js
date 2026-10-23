@@ -69,7 +69,7 @@ const setupPanningEvents = (doc) => {
                               elementUnderCursor.hasAttribute('data-pdf-text-space'))
 
         if (!hasTextUnderneath && !hasTextSelection) {
-            e.preventDefault()
+            if (e.pointerType !== 'touch') e.preventDefault()
             isPanning = true
             startX = e.screenX
             startY = e.screenY
