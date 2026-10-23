@@ -350,6 +350,7 @@ class View {
     #loadedDocument = null
     #destroyed = false
     #cancelLoad
+    #fontWaiters = new Set()
     #contentRange = document.createRange()
     #overlayer
     #vertical = false
@@ -464,6 +465,24 @@ class View {
             } else {
                 this.#iframe.src = src
             }
+        })
+    }
+    waitForFonts(signal) {
+        if (this.#destroyed || signal?.aborted) return Promise.resolve()
+        return new Promise((resolve, reject) => {
+            let settled = false
+            const finish = (error, failed = false) => {
+                if (settled) return
+                settled = true
+                this.#fontWaiters.delete(onAbort)
+                signal?.removeEventListener('abort', onAbort)
+                if (failed) reject(error)
+                else resolve()
+            }
+            const onAbort = () => finish()
+            this.#fontWaiters.add(onAbort)
+            signal?.addEventListener('abort', onAbort, { once: true })
+            this.fontReady.then(() => finish(), error => finish(error, true))
         })
     }
     render(layout) {
@@ -850,6 +869,7 @@ class View {
     destroy() {
         this.#destroyed = true
         this.#cancelLoad?.()
+        for (const finish of this.#fontWaiters) finish()
         this.#observer.disconnect()
         this.destroyLoupe()
         this.#loadedDocument = null
@@ -2034,6 +2054,9 @@ export class Paginator extends HTMLElement {
             // - Scrolled mode with anchor in top half — so the user can
             //   scroll backward into the previous section immediately
             const primaryView = this.#primaryView
+            await primaryView?.waitForFonts(signal)
+            if (this.#destroyed || signal?.aborted || this.#primaryIndex !== index
+                || this.#views.get(index) !== primaryView) return
             if (!this.noPreload && !this.noContinuousScroll && primaryView) {
                 const needsPrev = (primaryView.contentPages > 0 && primaryView.contentPages < this.columnCount)
                 if (needsPrev || this.scrolled) {
@@ -2224,7 +2247,9 @@ export class Paginator extends HTMLElement {
                         }
                     }
                 }
-                if (this.#destroyed || signal?.aborted) return
+                await primaryView?.waitForFonts(signal)
+                if (this.#destroyed || signal?.aborted || this.#primaryIndex !== index
+                    || this.#views.get(index) !== primaryView) return
                 // In noContinuousScroll mode, destroy all non-primary views
                 if (this.noContinuousScroll) {
                     for (const [i] of this.#views) {
