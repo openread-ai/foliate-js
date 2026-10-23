@@ -1040,8 +1040,10 @@ export class Paginator extends HTMLElement {
                 // Skip entirely while stabilizing — preserve #justAnchored
                 // so the first post-stabilization fire still sees it.
                 if (this.#stabilizing) return
-                if (this.#justAnchored) this.#justAnchored = false
-                else this.#afterScroll('scroll')
+                const atAnchor = this.#justAnchored
+                    && Math.abs(this.containerPosition - this.#scrollBounds[0]) <= 1
+                this.#justAnchored = false
+                if (!atAnchor) this.#afterScroll('scroll')
                 // Load previous section when user scrolls near the top.
                 // Done in debounced handler (not instant) to avoid cascade
                 // from rapid DOM insertions breaking scroll anchoring.
