@@ -344,7 +344,21 @@ const setStylesImportant = (el, styles) => {
 }
 
 class View {
-    #observer = new ResizeObserver(() => this.expand())
+    #resizeFrame = null
+    #resizeMayReanchor = false
+    #observer = new ResizeObserver(() => {
+        if (this.#destroyed) return
+        // Preserve fill/stabilize admission while moving iframe writes out of RO delivery.
+        this.#resizeMayReanchor = this.canReanchor()
+        if (this.#resizeFrame !== null) return
+        this.#resizeFrame = requestAnimationFrame(() => {
+            this.#resizeFrame = null
+            if (this.#destroyed) return
+            const mayReanchor = this.#resizeMayReanchor
+            this.#resizeMayReanchor = false
+            this.expand(mayReanchor)
+        })
+    })
     #element = document.createElement('div')
     #iframe = document.createElement('iframe')
     #loadedDocument = null
@@ -361,9 +375,10 @@ class View {
     #contentPages = 0
     #bgImageSize = null
     fontReady = Promise.resolve()
-    constructor({ container, onExpand }) {
+    constructor({ container, onExpand, canReanchor }) {
         this.container = container
         this.onExpand = onExpand
+        this.canReanchor = canReanchor
         this.#iframe.setAttribute('part', 'filter')
         this.#element.append(this.#iframe)
         Object.assign(this.#element.style, {
@@ -617,7 +632,7 @@ class View {
         }
         return 1.0
     }
-    expand() {
+    expand(mayReanchor = true) {
         if (!this.document?.documentElement) return
         const { documentElement } = this.document
         if (this.#column) {
@@ -681,7 +696,7 @@ class View {
                 this.#overlayer.redraw()
             }
         }
-        this.onExpand()
+        if (mayReanchor) this.onExpand()
     }
     set overlayer(overlayer) {
         this.#overlayer = overlayer
@@ -848,6 +863,9 @@ class View {
         this.#destroyed = true
         this.#cancelLoad?.()
         this.#observer.disconnect()
+        if (this.#resizeFrame !== null) cancelAnimationFrame(this.#resizeFrame)
+        this.#resizeFrame = null
+        this.#resizeMayReanchor = false
         this.destroyLoupe()
         this.#loadedDocument = null
     }
@@ -1211,19 +1229,22 @@ export class Paginator extends HTMLElement {
             this.#container.removeChild(existing.element)
             this.#views.delete(index)
         }
+        const canReanchor = () => {
+            // Only the primary view's resize should adjust scroll;
+            // non-primary views (preloaded/adjacent) must not scroll
+            if (this.#filling || this.#stabilizing) return false
+            // WebKit may finish iframe reflow after render() positioned the
+            // anchor. Correct that delayed layout while still anchored;
+            // ordinary Scroll expansion must not move a user's position.
+            if (this.scrolled && (!this.#justAnchored
+                || Math.abs(this.containerPosition - this.#scrollBounds?.[0]) > 1)) return false
+            return this.#primaryIndex === index
+        }
         const view = new View({
             container: this,
+            canReanchor,
             onExpand: () => {
-                // Only the primary view's resize should adjust scroll;
-                // non-primary views (preloaded/adjacent) must not scroll
-                if (this.#filling || this.#stabilizing) return
-                // WebKit may finish iframe reflow after render() positioned the
-                // anchor. Correct that delayed layout while still anchored;
-                // ordinary Scroll expansion must not move a user's position.
-                if (this.scrolled && (!this.#justAnchored
-                    || Math.abs(this.containerPosition - this.#scrollBounds?.[0]) > 1)) return
-                if (this.#primaryIndex === index)
-                    this.#scrollToAnchor(this.#anchor, 'reflow')
+                if (canReanchor()) this.#scrollToAnchor(this.#anchor, 'reflow')
             },
         })
         this.#views.set(index, view)
