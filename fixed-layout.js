@@ -639,7 +639,7 @@ export class FixedLayout extends HTMLElement {
         }
     }
     #renderScrollMode(targetIndex) {
-        const { width: hostWidth, height: hostHeight } = this.getBoundingClientRect()
+        const { clientWidth: hostWidth, clientHeight: hostHeight } = this
         if (!hostWidth) return
         // Remember current page so we can restore scroll position after resize
         const resized = this.#scrollViewport
@@ -671,7 +671,7 @@ export class FixedLayout extends HTMLElement {
         this.#syncPageSnapType()
     }
     #renderScrollPage(pageData) {
-        const { width: hostWidth, height: hostHeight } = this.getBoundingClientRect()
+        const { clientWidth: hostWidth, clientHeight: hostHeight } = this
         if (!hostWidth || !pageData.frame) return
         const { vpWidth: vw, vpHeight: vh, frame } = pageData
         const widthScale = hostWidth / vw
