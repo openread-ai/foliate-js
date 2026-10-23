@@ -218,6 +218,11 @@ export class View extends HTMLElement {
     #tocProgress
     #pageProgress
     #cfiProgress
+    #remoteNavigation
+    #cancelRemoteNavigation = () => {
+        this.#remoteNavigation?.abort()
+        this.#remoteNavigation = null
+    }
     #searchGeneration = 0
     #searchController = new AbortController()
     #searchResults = new Map()
@@ -228,7 +233,10 @@ export class View extends HTMLElement {
     history = new History()
     constructor() {
         super()
+        for (const type of ['wheel', 'touchstart', 'touchmove'])
+            this.addEventListener(type, this.#cancelRemoteNavigation, { passive: true })
         this.history.addEventListener('popstate', ({ detail }) => {
+            this.#cancelRemoteNavigation()
             const resolved = this.resolveNavigation(detail.state)
             this.renderer.goTo(resolved)
         })
@@ -301,6 +309,7 @@ export class View extends HTMLElement {
         }
     }
     close() {
+        this.#cancelRemoteNavigation()
         this.clearSearch()
         this.renderer?.destroy()
         this.renderer?.remove()
@@ -336,17 +345,21 @@ export class View extends HTMLElement {
     #emit(name, detail, cancelable) {
         return this.dispatchEvent(new CustomEvent(name, { detail, cancelable }))
     }
-    #onRelocate({ reason, range, index, fraction, size }) {
+    #onRelocate({ reason, range, index, fraction, size, origin }) {
+        if (!origin && ['navigation', 'selection', 'scroll', 'page', 'snap'].includes(reason))
+            this.#cancelRemoteNavigation()
         const progress = this.#sectionProgress?.getProgress(index, fraction, size) ?? {}
         const tocItem = this.#tocProgress?.getProgress(index, range)
         const pageItem = this.#pageProgress?.getProgress(index, range)
         const cfi = this.getCFI(index, range)
-        this.lastLocation = { ...progress, tocItem, pageItem, cfi, range }
+        this.lastLocation = { ...progress, tocItem, pageItem, cfi, range, reason, origin }
         if (reason === 'snap' || reason === 'page' || reason === 'scroll')
             this.history.replaceState(cfi)
         this.#emit('relocate', this.lastLocation)
     }
     #onLoad({ doc, index }) {
+        for (const type of ['wheel', 'touchstart', 'touchmove'])
+            doc.addEventListener(type, this.#cancelRemoteNavigation, { passive: true })
         doc.addEventListener('pdf-text-ready', () => {
             this.renderer?.getContents({ includeHidden: true })
                 .find(content => content.doc === doc)?.overlayer?.redraw()
@@ -524,23 +537,32 @@ export class View extends HTMLElement {
             console.error(`Could not resolve target ${target}`)
         }
     }
-    async goTo(target) {
+    async goTo(target, { origin } = {}) {
+        this.#cancelRemoteNavigation()
+        const controller = origin === 'remote-sync' ? new AbortController() : null
+        if (controller) this.#remoteNavigation = controller
         const resolved = this.resolveNavigation(target)
         try {
-            await this.renderer.goTo(resolved)
-            this.history.pushState(target)
+            await this.renderer.goTo(controller
+                ? Promise.resolve(resolved).then(value => ({ ...value, origin, signal: controller.signal }))
+                : resolved)
+            if (!controller?.signal.aborted) this.history.pushState(target)
             return resolved
         } catch(e) {
             console.error(e)
             console.error(`Could not go to ${target}`)
+        } finally {
+            if (controller && this.#remoteNavigation === controller) this.#remoteNavigation = null
         }
     }
     async goToFraction(frac) {
+        this.#cancelRemoteNavigation()
         const [index, anchor] = this.#sectionProgress.getSection(frac)
         await this.renderer.goTo({ index, anchor })
         this.history.pushState({ fraction: frac })
     }
     async select(target) {
+        this.#cancelRemoteNavigation()
         try {
             const obj = await this.resolveNavigation(target)
             await this.renderer.goTo({ ...obj, select: true })
@@ -583,12 +605,15 @@ export class View extends HTMLElement {
         }
     }
     async prev(distance) {
+        this.#cancelRemoteNavigation()
         await this.renderer.prev(distance)
     }
     async next(distance) {
+        this.#cancelRemoteNavigation()
         await this.renderer.next(distance)
     }
     async pan(dx, dy) {
+        this.#cancelRemoteNavigation()
         await this.renderer.pan(dx, dy)
     }
     isOverflowX() {
