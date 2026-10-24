@@ -709,8 +709,17 @@ export class FixedLayout extends HTMLElement {
         this.#scrollIdleTimer = setTimeout(() => {
             this.#setScrollIframeInteraction(true)
             if (this.#scrollViewport?.width === this.clientWidth
-                && this.#scrollViewport?.height === this.clientHeight)
+                && this.#scrollViewport?.height === this.clientHeight) {
+                const target = this.#scrollTarget
+                if (target) {
+                    // A quiet event gap can precede the native scroll's destination.
+                    const page = target.page.el.getBoundingClientRect()
+                    this.scrollTo({ top: this.scrollTop + page.top
+                        - this.getBoundingClientRect().top - this.clientTop
+                        + target.offset * page.height, behavior: 'instant' })
+                }
                 this.#scrollTarget = null
+            }
             // Report location only after scroll settles to avoid
             // expensive React re-renders on every frame
             this.#reportScrollLocation()

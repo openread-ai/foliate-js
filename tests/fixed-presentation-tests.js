@@ -280,6 +280,74 @@ try {
             && reopened.reader.getContents().some(item => item.index === 1 && item.doc.getElementById('passage')),
         'Reopen must retain the actual page reached after the resize')
     })
+    await run('partial scroll idle retains the turn through late presentation and reopen', async () => {
+        const sections = [section(0), section(1)]
+        const { reader, host, navigation } = makeReader(sections)
+        await navigation
+        assert(await apply(reader, { flow: 'scrolled', 'page-snap': '', zoom: 'fit-page' }) === 'applied',
+            'The actual scrolling presentation must settle before the turn')
+        await new Promise(resolve => {
+            const observer = new ResizeObserver(() => {
+                observer.disconnect()
+                resolve()
+            })
+            observer.observe(reader)
+        })
+        const height = reader.clientHeight
+        const originalTimeout = globalThis.setTimeout
+        const presented = deferred()
+        let idle
+        let partial
+        let delivered = false
+        globalThis.setTimeout = (callback, delay, ...args) => {
+            const timer = originalTimeout(callback, delay, ...args)
+            if (delay === 150 && typeof callback === 'function') idle = () => {
+                clearTimeout(timer)
+                callback(...args)
+            }
+            return timer
+        }
+        const present = event => {
+            if (event.detail.reason === 'scroll' && !delivered) {
+                delivered = true
+                presented.resolve(apply(reader))
+            }
+        }
+        const quiet = () => {
+            if (!idle || partial || reader.scrollTop <= 0 || reader.scrollTop >= height) return
+            partial = reader.scrollTop
+            globalThis.setTimeout = originalTimeout
+            idle()
+        }
+        reader.addEventListener('relocate', present)
+        reader.addEventListener('scroll', quiet)
+        try {
+            await reader.next()
+            assert(reader.index === 0, 'Admission must not publish an unrendered page')
+            assert(await presented.promise === 'applied', 'Late actual presentation must settle')
+            assert(partial > 0 && partial < height, 'The actual idle callback must see a partial native turn')
+            const target = reader.shadowRoot.querySelector('.scroll-page[data-index="1"]')
+            assert(reader.index === 1
+                && Math.abs(target.getBoundingClientRect().top - reader.getBoundingClientRect().top) < 1,
+            'Late presentation after partial idle must retain the physical page-turn destination')
+            const location = reader.index
+            reader.destroy()
+            host.remove()
+            const reopened = makeReader(sections, { index: location })
+            await reopened.navigation
+            assert(await apply(reopened.reader, { flow: 'scrolled', 'page-snap': '', zoom: 'fit-page' }) === 'applied'
+                && reopened.reader.index === 1, 'Reopen must retain the actual settled page')
+            const cancelled = reopened.reader
+            await cancelled.prev()
+            await cancelled.goTo({ index: 1 })
+            assert(await apply(cancelled) === 'applied' && cancelled.index === 1,
+                'Explicit newer navigation must revoke the earlier turn target')
+        } finally {
+            globalThis.setTimeout = originalTimeout
+            reader.removeEventListener('relocate', present)
+            reader.removeEventListener('scroll', quiet)
+        }
+    })
     await run('pending actual spread loading and destroy never publish a late frame', async () => {
         const held = deferred()
         const entered = deferred()
