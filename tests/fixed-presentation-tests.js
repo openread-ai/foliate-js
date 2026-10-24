@@ -152,6 +152,13 @@ try {
             return { status: 'rendered' }
         })])
         await navigation
+        await new Promise(resolve => {
+            const observer = new ResizeObserver(() => {
+                observer.disconnect()
+                resolve()
+            })
+            observer.observe(reader)
+        })
         held = deferred()
         const old = apply(reader, { zoom: 'fit-width' })
         await entered.promise
