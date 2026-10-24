@@ -82,6 +82,7 @@ export class FixedLayout extends HTMLElement {
     #scrollCurrentIndex = -1
     #scrollViewport = null
     #scrollPosition = 0
+    #scrollTarget = null
     #pageGestureTimer = null
     #pageWheelDelta = 0
     #pageTouch = null
@@ -707,6 +708,9 @@ export class FixedLayout extends HTMLElement {
         if (this.#scrollIdleTimer) clearTimeout(this.#scrollIdleTimer)
         this.#scrollIdleTimer = setTimeout(() => {
             this.#setScrollIframeInteraction(true)
+            if (this.#scrollViewport?.width === this.clientWidth
+                && this.#scrollViewport?.height === this.clientHeight)
+                this.#scrollTarget = null
             // Report location only after scroll settles to avoid
             // expensive React re-renders on every frame
             this.#reportScrollLocation()
@@ -739,6 +743,7 @@ export class FixedLayout extends HTMLElement {
         this.#scrollCurrentIndex = -1
         this.#scrollViewport = null
         this.#scrollPosition = 0
+        this.#scrollTarget = null
         if (this.#scrollContainer) {
             this.#scrollContainer.remove()
             this.#scrollContainer = null
@@ -922,7 +927,8 @@ export class FixedLayout extends HTMLElement {
         const resized = this.#scrollViewport
             && (this.#scrollViewport.width !== this.clientWidth
                 || this.#scrollViewport.height !== this.clientHeight)
-        const currentIndex = targetIndex >= 0 ? targetIndex
+        const target = this.#scrollTarget
+        const currentIndex = target ? target.page.index : targetIndex >= 0 ? targetIndex
             : this.#getScrollIndex(resized ? this.#scrollPosition : this.scrollTop)
         for (const page of this.#scrollPages) {
             const widthScale = hostWidth / page.vpWidth
@@ -941,13 +947,30 @@ export class FixedLayout extends HTMLElement {
         this.#updateScrollEndPadding()
         // Restore scroll position to keep current page in view after resize
         if (currentIndex >= 0 && currentIndex < this.#scrollPages.length) {
-            this.#scrollPages[currentIndex].el.scrollIntoView()
-            this.#scrollCurrentIndex = currentIndex
+            if (target) {
+                const page = target.page.el.getBoundingClientRect()
+                this.scrollTo({ top: this.scrollTop + page.top
+                    - this.getBoundingClientRect().top - this.clientTop
+                    + target.offset * page.height, behavior: 'instant' })
+            } else this.#scrollPages[currentIndex].el.scrollIntoView()
+            this.#scrollCurrentIndex = this.#getScrollIndex()
         }
         this.#scrollViewport = { width: this.clientWidth, height: this.clientHeight }
         this.#scrollPosition = this.scrollTop
         this.#syncPageSnapType()
         return rendering
+    }
+    #scrollBy(distance) {
+        const top = Math.max(0, Math.min(this.scrollTop + distance,
+            this.scrollHeight - this.clientHeight))
+        const page = this.#scrollPages[this.#getScrollIndex(top)]
+        if (page) {
+            const bounds = page.el.getBoundingClientRect()
+            const pageTop = this.scrollTop + bounds.top
+                - this.getBoundingClientRect().top - this.clientTop
+            this.#scrollTarget = { page, offset: (top - pageTop) / bounds.height }
+        }
+        this.scrollBy({ top: distance, behavior: 'smooth' })
     }
     #renderScrollPage(pageData, request) {
         if (!this.#isPresentationCurrent(request)) return false
@@ -1043,6 +1066,7 @@ export class FixedLayout extends HTMLElement {
         else this.style.removeProperty('scroll-snap-type')
     }
     #beginPageGesture() {
+        this.#scrollTarget = null
         if (!this.hasAttribute('page-snap')) return
         this.style.scrollSnapType = 'none'
     }
@@ -1492,6 +1516,7 @@ export class FixedLayout extends HTMLElement {
     }
     async goTo(target) {
         this.#interruptPresentation('superseded')
+        this.#scrollTarget = null
         const resolved = await target
         if (this.#destroyed) return
         if (this.#scrollMode) {
@@ -1513,7 +1538,7 @@ export class FixedLayout extends HTMLElement {
     async next(distance) {
         this.#interruptPresentation('superseded')
         if (this.#scrollMode) {
-            this.scrollBy({ top: distance || this.clientHeight, behavior: 'smooth' })
+            this.#scrollBy(distance || this.clientHeight)
             return
         }
         const s = this.rtl ? this.#goLeft() : this.#goRight()
@@ -1522,13 +1547,14 @@ export class FixedLayout extends HTMLElement {
     async prev(distance) {
         this.#interruptPresentation('superseded')
         if (this.#scrollMode) {
-            this.scrollBy({ top: -(distance || this.clientHeight), behavior: 'smooth' })
+            this.#scrollBy(-(distance || this.clientHeight))
             return
         }
         const s = this.rtl ? this.#goRight() : this.#goLeft()
         if (!s) return this.goToSpread(this.#index - 1, this.rtl ? 'left' : 'right', 'page')
     }
     nextSection() {
+        this.#scrollTarget = null
         if (!this.#scrollMode) return
         const currentIndex = this.#getScrollIndex()
         const nextIndex = Math.min(currentIndex + 1, this.#scrollPages.length - 1)
@@ -1536,6 +1562,7 @@ export class FixedLayout extends HTMLElement {
         this.#scrollCurrentIndex = nextIndex
     }
     prevSection() {
+        this.#scrollTarget = null
         if (!this.#scrollMode) return
         const currentIndex = this.#getScrollIndex()
         const prevIndex = Math.max(currentIndex - 1, 0)
@@ -1544,6 +1571,7 @@ export class FixedLayout extends HTMLElement {
     }
     async pan(dx, dy) {
         if (this.#scrollMode) {
+            this.#scrollTarget = null
             this.scrollBy({ top: dy, left: dx, behavior: 'auto' })
             return
         }
@@ -1632,6 +1660,7 @@ export class FixedLayout extends HTMLElement {
         return this.#scrollMode ? 'height' : 'width'
     }
     destroy() {
+        this.#scrollTarget = null
         this.#interruptPresentation('cancelled')
         this.#destroyed = true
         this.#lifetime.abort()

@@ -226,6 +226,53 @@ try {
         assert(await apply(reader, { flow: 'paginated' }) === 'applied', 'Return to paginated must await the restored spread')
         assert(!reader.scrolled && reader.index === 1, 'Restored paginated spread must retain the page')
     })
+    await run('resize during a smooth page turn retains its actual destination and reopened page', async () => {
+        const sections = [section(0), section(1)]
+        const { reader, host, navigation } = makeReader(sections)
+        await navigation
+        assert(await apply(reader, { flow: 'scrolled', 'page-snap': '', zoom: 'fit-page' }) === 'applied',
+            'The initial actual scrolling presentation must settle')
+        await new Promise(resolve => {
+            const observer = new ResizeObserver(() => {
+                observer.disconnect()
+                resolve()
+            })
+            observer.observe(reader)
+        })
+        const height = reader.clientHeight
+        let inFlight
+        const relocated = new Promise(resolve => reader.addEventListener('relocate', event => {
+            if (event.detail.reason === 'scroll') resolve(event.detail)
+        }))
+        const resize = () => {
+            if (reader.scrollTop <= 0 || reader.scrollTop >= height) return
+            reader.removeEventListener('scroll', resize)
+            inFlight = { top: reader.scrollTop, index: reader.index }
+            host.style.height = `${height + 60}px`
+        }
+        reader.addEventListener('scroll', resize)
+        await reader.next()
+        assert(reader.index === 0, 'An admitted turn must not publish its unrendered destination')
+        const location = await relocated
+        assert(inFlight?.top > 0 && inFlight.top < height && inFlight.index === 0,
+            'Resize must occur during actual scrolling before the destination is current')
+        assert(reader.clientHeight === height + 60 && location.index === 1 && reader.index === 1,
+            'The actual resized reader must settle on the single page-turn destination')
+        const target = reader.shadowRoot.querySelector('.scroll-page[data-index="1"]')
+        assert(Math.abs(target.getBoundingClientRect().top - reader.getBoundingClientRect().top) < 1,
+            'The destination must physically occupy the leading viewport edge')
+        assert(reader.getContents().some(item => item.index === 1 && item.doc.getElementById('passage')),
+            'The actual destination document must be loaded')
+        reader.destroy()
+        host.remove()
+        const reopened = makeReader(sections, { index: location.index })
+        await reopened.navigation
+        assert(await apply(reopened.reader, { flow: 'scrolled', 'page-snap': '', zoom: 'fit-page' }) === 'applied',
+            'Reopening the actual settled page must complete')
+        assert(reopened.reader.index === 1
+            && reopened.reader.getContents().some(item => item.index === 1 && item.doc.getElementById('passage')),
+        'Reopen must retain the actual page reached after the resize')
+    })
     await run('pending actual spread loading and destroy never publish a late frame', async () => {
         const held = deferred()
         const entered = deferred()
