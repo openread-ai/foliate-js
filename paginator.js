@@ -638,6 +638,9 @@ class View {
         if (this.#column) {
             const side = this.#vertical ? 'height' : 'width'
             const otherSide = this.#vertical ? 'width' : 'height'
+            const columnSize = this.#size / this.#columnCount
+            // One column per "page" — overflow columns extend into adjacent pages
+            documentElement.style[side] = `${columnSize}px`
             const contentRect = this.#contentRange.getBoundingClientRect()
             const rootRect = documentElement.getBoundingClientRect()
             // offset caused by column break at the start of the page
@@ -648,7 +651,6 @@ class View {
             // Size content by individual columns, not full spreads.
             // This allows adjacent sections to share a spread when a
             // section doesn't fill all available columns.
-            const columnSize = this.#size / this.#columnCount
             const pageCount = Math.ceil(contentSize / columnSize)
             this.#contentPages = pageCount
             const expandedSize = pageCount * columnSize
@@ -657,8 +659,6 @@ class View {
             this.#element.style[side] = `${expandedSize}px`
             this.#iframe.style[otherSide] = '100%'
             this.#element.style[otherSide] = '100%'
-            // One column per "page" — overflow columns extend into adjacent pages
-            documentElement.style[side] = `${columnSize}px`
             if (this.#overlayer) {
                 this.#overlayer.element.style.margin = '0'
                 this.#overlayer.element.style.left = '0'

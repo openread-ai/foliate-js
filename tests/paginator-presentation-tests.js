@@ -370,6 +370,89 @@ try {
         assert(reader.getContents().length === 2 && prepared.length === 2,
             'Prepare exactly the two documents required by the new viewport')
     })
+    await run('keeps the current source through resize and later preceding-document expansion', async () => {
+        const pages = count => `<!doctype html><html><head><title>Owned columns</title></head><body>${
+            Array.from({ length: count }, (_, index) => `<p id="p${index}" style="${
+                index ? 'break-before: column' : ''}">Column ${index}. Keep this source passage visible.</p>`).join('')
+        }</body></html>`
+        const held = deferred()
+        const started = deferred()
+        const currentLoaded = deferred()
+        const futureLoaded = deferred()
+        let futureStarted = false
+        const { reader, host, navigation } = makeReader([
+            section(pages(5)), section(pages(8)), {
+                load: () => { futureStarted = true; started.resolve(); return held.promise },
+                loadContent: async () => pages(8),
+            },
+        ], { preload: true })
+        host.style.width = '600px'
+        host.style.height = '900px'
+        reader.setAttribute('max-column-count', '1')
+        reader.setAttribute('max-inline-size', '1280px')
+        reader.addEventListener('load', ({ detail }) => {
+            if (detail.index === 1) currentLoaded.resolve(detail.doc)
+            if (detail.index === 2) futureLoaded.resolve(detail.doc)
+        })
+        try {
+            await navigation
+            const doc = await currentLoaded.promise
+            await reader.goTo({ index: 1 })
+            assert(await apply(reader, presentation('body { font: 16px/1.5 serif; }')) === 'applied',
+                'The actual current and preceding documents must apply before resizing')
+            assert(!futureStarted, 'The future document must still be outside the initial preload distance')
+            const previous = reader.getContents().find(item => item.index === 0).doc
+            const previousFrame = previous.defaultView.frameElement
+            const glyph = doc.createRange()
+            const text = doc.getElementById('p0').firstChild
+            glyph.setStart(text, 0)
+            glyph.setEnd(text, 1)
+            const glyphVisible = () => {
+                const frame = doc.defaultView.frameElement.getBoundingClientRect()
+                const rect = glyph.getBoundingClientRect()
+                const viewport = reader.shadowRoot.querySelector('#container').getBoundingClientRect()
+                return frame.left + rect.left >= viewport.left && frame.left + rect.right <= viewport.right
+                    && frame.top + rect.top >= viewport.top && frame.top + rect.bottom <= viewport.bottom
+            }
+            // Start the real scroll-triggered forward preload, then return to
+            // the current source before either resize or deferred work completes.
+            await reader.scrollToAnchor(doc.getElementById('p6'))
+            await started.promise
+            await reader.scrollToAnchor(doc.getElementById('p0'))
+            assert(glyphVisible(), 'The current source must initially be visible')
+            const precedingResized = new Promise(resolve => {
+                const observer = new ResizeObserver(() => {
+                    if (reader.size === 960 && previousFrame.getBoundingClientRect().width === 5 * reader.size) {
+                        observer.disconnect()
+                        resolve()
+                    }
+                })
+                observer.observe(previousFrame)
+            })
+            const resized = new Promise(resolve => {
+                const onRelocate = ({ detail }) => {
+                    if (detail.reason !== 'reflow' || reader.size !== 960) return
+                    reader.removeEventListener('relocate', onRelocate)
+                    resolve()
+                }
+                reader.addEventListener('relocate', onRelocate)
+            })
+            host.style.width = '960px'
+            await resized
+            held.resolve('about:blank')
+            const future = await futureLoaded.promise
+            await Promise.all([previous.fonts.ready, doc.fonts.ready, future.fonts.ready, precedingResized])
+            assert(glyphVisible(),
+                'Resize and actual forward-load style completion must not displace the current source')
+            let turn
+            reader.addEventListener('relocate', ({ detail }) => { if (detail.reason === 'page') turn = detail })
+            await reader.next()
+            assert(turn?.index === 1 && turn.range.compareBoundaryPoints(Range.START_TO_START, glyph) > 0,
+                'One actual Next must advance the current source instead of returning to its old start')
+        } finally {
+            held.resolve('about:blank')
+        }
+    })
     document.documentElement.dataset.paginatorPresentationStatus = 'passed'
 } catch (error) {
     document.documentElement.dataset.paginatorPresentationStatus = 'failed'
