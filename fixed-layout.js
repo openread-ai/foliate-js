@@ -34,7 +34,18 @@ const getViewport = (doc, viewport) => {
 export class FixedLayout extends HTMLElement {
     static observedAttributes = ['zoom', 'scale-factor', 'spread', 'flow', 'page-snap']
     #root = this.attachShadow({ mode: 'open' })
-    #observer = new ResizeObserver(() => this.#render())
+    #observer = new ResizeObserver(() => {
+        if (!this.#presentation && !this.#destroyed) this.#render()
+    })
+    #destroyed = false
+    #lifetime = new AbortController()
+    #presentation = null
+    #batchingPresentation = false
+    #spreadGeneration = 0
+    #spreadReady = Promise.resolve()
+    #displayedSpread = -1
+    #styles
+    #styleMap = new WeakMap()
     #spreads
     #index = -1
     defaultViewport
@@ -71,6 +82,7 @@ export class FixedLayout extends HTMLElement {
     #scrollCurrentIndex = -1
     #scrollViewport = null
     #scrollPosition = 0
+    #scrollTarget = null
     #pageGestureTimer = null
     #pageWheelDelta = 0
     #pageTouch = null
@@ -130,37 +142,214 @@ export class FixedLayout extends HTMLElement {
         this.#observer.observe(this)
     }
     attributeChangedCallback(name, _, value) {
+        if (!this.#batchingPresentation) this.#interruptPresentation('superseded')
         switch (name) {
             case 'zoom':
                 this.#zoom = value !== 'fit-width' && value !== 'fit-page'
                     ? parseFloat(value) : value
-                this.#render()
+                if (!this.#batchingPresentation) this.#render()
                 break
             case 'scale-factor':
-                this.#scaleFactor = parseFloat(value) / 100
-                this.#render()
+                this.#scaleFactor = value === null ? 1.0 : parseFloat(value) / 100
+                if (!this.#batchingPresentation) this.#render()
                 break
             case 'spread':
-                this.#respread(value)
+                if (!this.#batchingPresentation) this.#respread(value)
                 break
             case 'flow':
+                if (this.#batchingPresentation) break
                 if (value === 'scrolled' && !this.#scrollMode) {
                     // Capture index from paginated mode BEFORE setting scroll flag
                     const savedIndex = this.index
                     this.#scrollMode = true
                     if (this.book) this.#initScrollMode(savedIndex)
                 } else if (value !== 'scrolled' && this.#scrollMode) {
-                    this.#destroyScrollMode()
                     this.#scrollMode = false
-                    this.#render()
+                    this.#destroyScrollMode()
                 }
                 break
             case 'page-snap':
-                if (this.#scrollMode) this.#renderScrollMode(this.#scrollCurrentIndex)
+                if (this.#scrollMode && !this.#batchingPresentation)
+                    this.#renderScrollMode(this.#scrollCurrentIndex)
                 break
         }
     }
-    async #createFrame({ index, src: srcOption, detached = false }) {
+    #interruptPresentation(outcome) {
+        const request = this.#presentation
+        if (!request) return
+        this.#presentation = null
+        request.outcome = outcome
+        request.controller.abort()
+        request.interrupt(outcome)
+    }
+    #isPresentationCurrent(request) {
+        return !this.#destroyed && (!request || this.#presentation === request
+            && !request.controller.signal.aborted)
+    }
+    #setDocumentStyles(doc) {
+        if (this.#styles === undefined) return
+        let styles = this.#styleMap.get(doc)
+        if (!styles) {
+            styles = [doc.createElement('style'), doc.createElement('style')]
+            const head = doc.head ?? doc.documentElement
+            head.prepend(styles[0])
+            head.append(styles[1])
+            this.#styleMap.set(doc, styles)
+        }
+        const [before, after] = Array.isArray(this.#styles)
+            ? this.#styles : ['', this.#styles]
+        styles[0].textContent = before
+        styles[1].textContent = after
+    }
+    async #preparePresentationFrame(frame, request) {
+        if (!this.#isPresentationCurrent(request) || !frame?.iframe?.isConnected)
+            return false
+        const doc = frame.iframe.contentDocument
+        if (!doc || frame.blank) return false
+        if (!request.prepared.has(doc)) {
+            request.prepared.set(doc, (async () => {
+                this.#setDocumentStyles(doc)
+                await request.prepareDocument?.(doc, request.controller.signal)
+                if (!this.#isPresentationCurrent(request)) return false
+                doc.documentElement.getBoundingClientRect()
+                await doc.fonts?.ready
+                return this.#isPresentationCurrent(request)
+                    && frame.iframe.contentDocument === doc && frame.iframe.isConnected
+            })())
+        }
+        return request.prepared.get(doc)
+    }
+    #requiredFrames() {
+        if (this.#center) return [this.#center]
+        const { width, height } = this.getBoundingClientRect()
+        const portrait = this.spread !== 'both' && this.spread !== 'portrait'
+            && height > width * 1.2
+        if (portrait) return [this.#side === 'left' ? this.#left : this.#right]
+        return [this.#left, this.#right].filter(frame => frame && !frame.blank)
+    }
+    async applyPresentation(presentation, signal) {
+        this.#interruptPresentation('superseded')
+        if (this.#destroyed || signal.aborted) return 'cancelled'
+        const { width, height } = this.getBoundingClientRect()
+        const index = this.index
+        if (!this.book || index < 0 || width <= 0 || height <= 0) return 'unavailable'
+        let interrupt
+        const interrupted = new Promise(resolve => { interrupt = resolve })
+        const request = { interrupt, outcome: null, controller: new AbortController(),
+            prepared: new Map(), prepareDocument: presentation.prepareDocument }
+        const abort = () => {
+            if (this.#presentation === request) this.#interruptPresentation('cancelled')
+        }
+        this.#presentation = request
+        signal.addEventListener('abort', abort, { once: true })
+        try {
+            this.#batchingPresentation = true
+            try {
+                for (const [name, value] of Object.entries(presentation.attributes)) {
+                    if (!FixedLayout.observedAttributes.includes(name))
+                        throw new TypeError(`Unsupported fixed-layout presentation attribute: ${name}`)
+                    if (value === null) this.removeAttribute(name)
+                    else this.setAttribute(name, value)
+                }
+            } finally {
+                this.#batchingPresentation = false
+            }
+            if (presentation.styles !== undefined) this.#styles = presentation.styles
+            const work = this.#settlePresentation(request, index)
+            const outcome = await Promise.race([work, interrupted])
+            return request.outcome ?? outcome
+        } catch (error) {
+            if (request.outcome) return request.outcome
+            throw error
+        } finally {
+            signal.removeEventListener('abort', abort)
+            if (this.#presentation === request) this.#presentation = null
+            request.controller.abort()
+        }
+    }
+    async #settlePresentation(request, index) {
+        const current = () => this.#isPresentationCurrent(request)
+        await this.#spreadReady
+        if (!current()) return 'superseded'
+        const scrolled = this.getAttribute('flow') === 'scrolled'
+        if (scrolled !== this.#scrollMode) {
+            if (scrolled) {
+                this.#scrollMode = true
+                await this.#initScrollMode(index, request)
+            } else {
+                this.#scrollMode = false
+                await this.#destroyScrollMode(request)
+            }
+        } else if (!scrolled && this.spread !==
+            (this.getAttribute('spread') || this.book.rendition?.spread)) {
+            await this.#respread(this.getAttribute('spread'), request)
+        }
+        if (!current()) return 'superseded'
+        // An interrupted source load can leave the previous spread's frames
+        // connected. Only the completed spread owns the current presentation.
+        if (!scrolled && this.#displayedSpread !== this.#index) {
+            const spread = this.#index
+            this.#index = -1
+            await this.goToSpread(spread, this.#side, 'presentation', request)
+            if (!current()) return 'superseded'
+        }
+        if (scrolled) {
+            const prepared = new Set()
+            let settledBounds
+            while (current()) {
+                const bounds = this.getBoundingClientRect()
+                if (bounds.width <= 0 || bounds.height <= 0) return 'unavailable'
+                const required = this.#scrollPages.filter(page => {
+                    const rect = page.el.getBoundingClientRect()
+                    return page.index === this.index
+                        || rect.bottom > bounds.top && rect.top < bounds.bottom
+                })
+                const pending = required.filter(page => !prepared.has(page))
+                if (!pending.length && settledBounds?.width === bounds.width
+                    && settledBounds.height === bounds.height) break
+                for (const page of pending) {
+                    await this.#loadScrollPage(page, request, false)
+                    if (!current()) return 'superseded'
+                    if (!await this.#preparePresentationFrame(page.frame, request))
+                        return 'unavailable'
+                    prepared.add(page)
+                }
+                settledBounds = this.getBoundingClientRect()
+                if (settledBounds.width <= 0 || settledBounds.height <= 0) return 'unavailable'
+                const outcomes = await Promise.all(this.#renderScrollMode(this.index, request))
+                if (outcomes.some(value => value === false)) return 'unavailable'
+            }
+            if (!prepared.size) return 'unavailable'
+        } else {
+            while (current()) {
+                const bounds = this.getBoundingClientRect()
+                if (bounds.width <= 0 || bounds.height <= 0) return 'unavailable'
+                const frames = this.#requiredFrames()
+                if (!frames.length || (await Promise.all(frames.map(frame =>
+                    this.#preparePresentationFrame(frame, request)))).some(value => !value))
+                    return 'unavailable'
+                if (!current()) return 'superseded'
+                const preparedBounds = this.getBoundingClientRect()
+                if (preparedBounds.width !== bounds.width || preparedBounds.height !== bounds.height)
+                    continue
+                const outcomes = await Promise.all(this.#render(this.#side, request))
+                if (outcomes.some(value => value === false)) return 'unavailable'
+                const renderedBounds = this.getBoundingClientRect()
+                if (renderedBounds.width === bounds.width && renderedBounds.height === bounds.height) break
+            }
+        }
+        if (!current()) return 'superseded'
+        const bounds = this.getBoundingClientRect()
+        if (bounds.width <= 0 || bounds.height <= 0) return 'unavailable'
+        if (scrolled) this.#reportScrollLocation('presentation')
+        else {
+            this.#reportLocation('presentation')
+            this.#preloadNextSpreads()
+        }
+        return 'applied'
+    }
+    async #createFrame({ index, src: srcOption, detached = false, request }) {
+        if (!this.#isPresentationCurrent(request)) return null
         const srcOptionIsString = typeof srcOption === 'string'
         const src = srcOptionIsString ? srcOption : srcOption?.src
         const data = srcOptionIsString ? null : srcOption?.data
@@ -192,20 +381,35 @@ export class FixedLayout extends HTMLElement {
 
         if (!src) return { blank: true, element, iframe }
         return new Promise(resolve => {
-            iframe.addEventListener('load', () => {
+            const signal = request?.controller.signal ?? this.#lifetime.signal
+            const finish = value => {
+                signal.removeEventListener('abort', cancel)
+                iframe.removeEventListener('load', loaded)
+                resolve(value)
+            }
+            const cancel = () => {
+                element.remove()
+                finish(null)
+            }
+            const loaded = () => {
+                if (!this.#isPresentationCurrent(request)) return cancel()
                 const doc = iframe.contentDocument
+                this.#setDocumentStyles(doc)
                 iframe.dataset.sectionIndex = index
                 this.dispatchEvent(new CustomEvent('load', { detail: { doc, index } }))
                 this.#listenForPageGestures(doc)
                 const { width, height } = getViewport(doc, this.defaultViewport)
-                resolve({
+                finish({
                     element, iframe,
                     width: parseFloat(width),
                     height: parseFloat(height),
                     onZoom,
                     detached,
                 })
-            }, { once: true })
+            }
+            iframe.addEventListener('load', loaded, { once: true })
+            signal.addEventListener('abort', cancel, { once: true })
+            if (signal.aborted) return cancel()
             if (data) {
                 iframe.srcdoc = data
             } else {
@@ -213,10 +417,10 @@ export class FixedLayout extends HTMLElement {
             }
         })
     }
-    #render(side = this.#side) {
+    #render(side = this.#side, request) {
+        if (!this.#isPresentationCurrent(request)) return []
         if (this.#scrollMode) {
-            this.#renderScrollMode()
-            return []
+            return this.#renderScrollMode(undefined, request)
         }
         if (!side) return []
         const left = this.#left ?? {}
@@ -277,7 +481,8 @@ export class FixedLayout extends HTMLElement {
                 element.style.display = 'none'
             }
 
-            renderPromises.push(this.#renderFrameOverlayer(frame, scale))
+            if (!request || !frame.blank && (!portrait || frame === target))
+                renderPromises.push(this.#renderFrameOverlayer(frame, scale, request))
 
             const container= element.parentNode?.host
             if (!container) return
@@ -309,7 +514,8 @@ export class FixedLayout extends HTMLElement {
         }
         return renderPromises
     }
-    async #renderFrameOverlayer(frame, scale) {
+    async #renderFrameOverlayer(frame, scale, request) {
+        if (!this.#isPresentationCurrent(request)) return false
         const generation = (frame.renderGeneration ?? 0) + 1
         frame.renderGeneration = generation
         const doc = frame.iframe.contentDocument
@@ -317,14 +523,20 @@ export class FixedLayout extends HTMLElement {
             ? parseInt(frame.iframe.dataset.sectionIndex) : undefined
         if (frame.onZoom) {
             try {
-                await frame.onZoom({ doc, scale, pageColors: this.#pageColors })
+                const outcome = await frame.onZoom({ doc, scale, pageColors: this.#pageColors,
+                    signal: request?.controller.signal ?? this.#lifetime.signal })
+                if (!this.#isPresentationCurrent(request)) return false
+                if (outcome?.status === 'failed') throw outcome.error
+                if (outcome?.status === 'cancelled') return false
             } catch (error) {
                 console.warn('Failed to render fixed-layout page', index, error)
-                return
+                if (request && this.#isPresentationCurrent(request)) throw error
+                return false
             }
         }
-        if (frame.renderGeneration !== generation || !frame.iframe.isConnected) return
-        if (index == null || !doc) return
+        if (!this.#isPresentationCurrent(request)
+            || frame.renderGeneration !== generation || !frame.iframe.isConnected) return false
+        if (index == null || !doc) return false
         let overlayer = this.#overlayers.get(index)
         if (!overlayer || overlayer.element.parentElement !== frame.element) {
             this.dispatchEvent(new CustomEvent('create-overlayer', {
@@ -350,8 +562,12 @@ export class FixedLayout extends HTMLElement {
             })
             overlayer.redraw()
         }
+        return true
     }
-    async #showSpread({ left, right, center, side, spreadIndex }) {
+    async #showSpread({ left, right, center, side, spreadIndex, request, generation }) {
+        const current = () => this.#isPresentationCurrent(request)
+            && this.#spreadGeneration === generation
+        if (!current()) return false
         this.#left = null
         this.#right = null
         this.#center = null
@@ -369,14 +585,26 @@ export class FixedLayout extends HTMLElement {
             }
         } else {
             if (center) {
-                this.#center = await this.#createFrame(center)
+                const frame = await this.#createFrame({ ...center, request })
+                if (!current()) { frame?.element?.remove(); return false }
+                if (!frame) return false
+                this.#center = frame
                 if (cacheKey) {
                     this.#prerenderedSpreads.set(cacheKey, { center: this.#center })
                     this.#spreadAccessTime.set(cacheKey, Date.now())
                 }
             } else {
-                this.#left = await this.#createFrame(left)
-                this.#right = await this.#createFrame(right)
+                const leftFrame = await this.#createFrame({ ...left, request })
+                if (!current()) { leftFrame?.element?.remove(); return false }
+                const rightFrame = await this.#createFrame({ ...right, request })
+                if (!current()) {
+                    leftFrame?.element?.remove()
+                    rightFrame?.element?.remove()
+                    return false
+                }
+                if (!leftFrame || !rightFrame) return false
+                this.#left = leftFrame
+                this.#right = rightFrame
                 if (cacheKey) {
                     this.#prerenderedSpreads.set(cacheKey, { left: this.#left, right: this.#right })
                     this.#spreadAccessTime.set(cacheKey, Date.now())
@@ -402,10 +630,15 @@ export class FixedLayout extends HTMLElement {
         // Render layout and await any async onZoom callbacks (e.g. PDF text
         // layer rendering) so the document is fully populated before overlayers
         // try to resolve CFIs against it.
-        const renderPromises = this.#render()
-        if (renderPromises.length) await Promise.all(renderPromises)
+        if (!request) {
+            const renderPromises = this.#render()
+            if (renderPromises.length) await Promise.all(renderPromises)
+        }
+        if (!current()) return false
+        this.#displayedSpread = spreadIndex
+        return true
     }
-    #initScrollMode(targetIndex = 0) {
+    async #initScrollMode(targetIndex = 0, request) {
         const currentIndex = targetIndex
 
         // Hide all paginated content
@@ -429,7 +662,12 @@ export class FixedLayout extends HTMLElement {
             return { el, index: i, section, state: 'idle', frame: null, vpWidth: vw, vpHeight: vh }
         })
 
-        this.#renderScrollMode()
+        if (request) {
+            const page = this.#scrollPages[currentIndex]
+            if (page) await this.#loadScrollPage(page, request, false)
+            if (!this.#isPresentationCurrent(request)) return
+            this.#renderScrollMode(currentIndex, request)
+        } else this.#renderScrollMode()
 
         // Scroll to target position BEFORE setting up the observer
         // so only pages near the target are observed as intersecting
@@ -470,6 +708,18 @@ export class FixedLayout extends HTMLElement {
         if (this.#scrollIdleTimer) clearTimeout(this.#scrollIdleTimer)
         this.#scrollIdleTimer = setTimeout(() => {
             this.#setScrollIframeInteraction(true)
+            if (this.#scrollViewport?.width === this.clientWidth
+                && this.#scrollViewport?.height === this.clientHeight) {
+                const target = this.#scrollTarget
+                if (target) {
+                    // A quiet event gap can precede the native scroll's destination.
+                    const page = target.page.el.getBoundingClientRect()
+                    this.scrollTo({ top: this.scrollTop + page.top
+                        - this.getBoundingClientRect().top - this.clientTop
+                        + target.offset * page.height, behavior: 'instant' })
+                }
+                this.#scrollTarget = null
+            }
             // Report location only after scroll settles to avoid
             // expensive React re-renders on every frame
             this.#reportScrollLocation()
@@ -478,7 +728,7 @@ export class FixedLayout extends HTMLElement {
     #setScrollIframeInteraction(enabled) {
         this.#scrollContainer?.classList.toggle('scrolling', !enabled)
     }
-    #destroyScrollMode() {
+    async #destroyScrollMode(request) {
         // Use the cached scroll index because by the time attributeChangedCallback
         // fires, the CSS has already switched from block/scroll to flex layout,
         // making #getScrollIndex() return incorrect positions
@@ -502,6 +752,7 @@ export class FixedLayout extends HTMLElement {
         this.#scrollCurrentIndex = -1
         this.#scrollViewport = null
         this.#scrollPosition = 0
+        this.#scrollTarget = null
         if (this.#scrollContainer) {
             this.#scrollContainer.remove()
             this.#scrollContainer = null
@@ -518,18 +769,23 @@ export class FixedLayout extends HTMLElement {
 
         // Navigate to the page we were on
         if (currentIndex >= 0) {
+            if (this.spread !== (this.getAttribute('spread') || this.book.rendition?.spread)) {
+                await this.#respread(this.getAttribute('spread'), request, currentIndex)
+                return
+            }
             const section = this.book.sections[currentIndex]
             if (section) {
                 const spread = this.getSpreadOf(section)
                 if (spread) {
                     this.#index = -1
-                    this.goToSpread(spread.index, spread.side, 'page')
+                    await this.goToSpread(spread.index, spread.side, 'page', request)
                 }
             }
         }
     }
     // Create an iframe directly inside the page placeholder (no reparenting)
-    async #createScrollFrame(pageData, srcOption) {
+    async #createScrollFrame(pageData, srcOption, request) {
+        if (!this.#isPresentationCurrent(request)) return null
         const srcOptionIsString = typeof srcOption === 'string'
         const src = srcOptionIsString ? srcOption : srcOption?.src
         const data = srcOptionIsString ? null : srcOption?.data
@@ -553,18 +809,33 @@ export class FixedLayout extends HTMLElement {
 
         if (!src) return { blank: true, element, iframe }
         return new Promise(resolve => {
-            iframe.addEventListener('load', () => {
+            const signal = request?.controller.signal ?? this.#lifetime.signal
+            const finish = value => {
+                signal.removeEventListener('abort', cancel)
+                iframe.removeEventListener('load', loaded)
+                resolve(value)
+            }
+            const cancel = () => {
+                element.remove()
+                finish(null)
+            }
+            const loaded = () => {
+                if (!this.#isPresentationCurrent(request)) return cancel()
                 const doc = iframe.contentDocument
+                this.#setDocumentStyles(doc)
                 iframe.dataset.sectionIndex = pageData.index
                 this.dispatchEvent(new CustomEvent('load', { detail: { doc, index: pageData.index } }))
                 const { width, height } = getViewport(doc, this.defaultViewport)
-                resolve({
+                finish({
                     element, iframe,
                     width: parseFloat(width),
                     height: parseFloat(height),
                     onZoom,
                 })
-            }, { once: true })
+            }
+            iframe.addEventListener('load', loaded, { once: true })
+            signal.addEventListener('abort', cancel, { once: true })
+            if (signal.aborted) return cancel()
             if (data) {
                 iframe.srcdoc = data
             } else {
@@ -572,45 +843,63 @@ export class FixedLayout extends HTMLElement {
             }
         })
     }
-    async #loadScrollPage(pageData) {
-        if (pageData.state !== 'idle') return
+    async #loadScrollPage(pageData, request, render = true) {
+        if (pageData.state === 'loading') {
+            await pageData.loading
+            // A previous request may have cancelled the load we joined.
+            if (pageData.state === 'idle' && this.#isPresentationCurrent(request))
+                return this.#loadScrollPage(pageData, request, render)
+            return
+        }
+        if (pageData.state !== 'idle' || !this.#isPresentationCurrent(request)) return
         pageData.state = 'loading'
 
         // Generation counter to detect stale loads
         const gen = (this.#scrollLoadGen.get(pageData.index) || 0) + 1
         this.#scrollLoadGen.set(pageData.index, gen)
 
+        const current = () => this.#isPresentationCurrent(request)
+            && this.#scrollLoadGen.get(pageData.index) === gen && this.#scrollMode
+        const loading = (async () => {
+            try {
+                const src = await pageData.section.load?.()
+                // Bail if cancelled or mode changed
+                if (!current()) {
+                    pageData.state = 'idle'
+                    return
+                }
+                if (!src) { pageData.state = 'idle'; return }
+
+                const frame = await this.#createScrollFrame(pageData, src, request)
+                // Bail if cancelled during frame creation
+                if (!current() || !frame) {
+                    frame?.element?.remove()
+                    pageData.state = 'idle'
+                    return
+                }
+
+                pageData.frame = frame
+                pageData.state = 'loaded'
+                // Update dimensions from actual page viewport
+                if (frame.width && frame.height) {
+                    pageData.vpWidth = frame.width
+                    pageData.vpHeight = frame.height
+                }
+                if (render) await this.#renderScrollPage(pageData, request)
+                if (!current()) return
+                const doc = frame.iframe.contentDocument
+                if (doc) this.#listenForPageGestures(doc)
+            } catch (e) {
+                console.warn('Failed to load scroll page', pageData.index, e)
+                pageData.state = 'idle'
+                if (request && current()) throw e
+            }
+        })()
+        pageData.loading = loading
         try {
-            const src = await pageData.section.load?.()
-            // Bail if cancelled or mode changed
-            if (this.#scrollLoadGen.get(pageData.index) !== gen || !this.#scrollMode) {
-                pageData.state = 'idle'
-                return
-            }
-            if (!src) { pageData.state = 'idle'; return }
-
-            const frame = await this.#createScrollFrame(pageData, src)
-            // Bail if cancelled during frame creation
-            if (this.#scrollLoadGen.get(pageData.index) !== gen || !this.#scrollMode) {
-                frame.element?.remove()
-                pageData.state = 'idle'
-                return
-            }
-
-            pageData.frame = frame
-            pageData.state = 'loaded'
-            // Update dimensions from actual page viewport
-            if (frame.width && frame.height) {
-                pageData.vpWidth = frame.width
-                pageData.vpHeight = frame.height
-            }
-            await this.#renderScrollPage(pageData)
-            if (this.#scrollLoadGen.get(pageData.index) !== gen || !this.#scrollMode) return
-            const doc = frame.iframe.contentDocument
-            if (doc) this.#listenForPageGestures(doc)
-        } catch (e) {
-            console.warn('Failed to load scroll page', pageData.index, e)
-            pageData.state = 'idle'
+            await loading
+        } finally {
+            if (pageData.loading === loading) pageData.loading = null
         }
     }
     // Remove a loaded scroll page's frame and overlayer
@@ -638,14 +927,17 @@ export class FixedLayout extends HTMLElement {
             this.#teardownScrollPage(page)
         }
     }
-    #renderScrollMode(targetIndex) {
+    #renderScrollMode(targetIndex, request) {
+        if (!this.#isPresentationCurrent(request)) return []
         const { width: hostWidth, height: hostHeight } = this.getBoundingClientRect()
-        if (!hostWidth) return
+        if (!hostWidth) return []
+        const rendering = []
         // Remember current page so we can restore scroll position after resize
         const resized = this.#scrollViewport
             && (this.#scrollViewport.width !== this.clientWidth
                 || this.#scrollViewport.height !== this.clientHeight)
-        const currentIndex = targetIndex >= 0 ? targetIndex
+        const target = this.#scrollTarget
+        const currentIndex = target ? target.page.index : targetIndex >= 0 ? targetIndex
             : this.#getScrollIndex(resized ? this.#scrollPosition : this.scrollTop)
         for (const page of this.#scrollPages) {
             const widthScale = hostWidth / page.vpWidth
@@ -657,22 +949,42 @@ export class FixedLayout extends HTMLElement {
             page.el.style.minHeight = this.hasAttribute('page-snap')
                 ? `${this.clientHeight}px` : ''
             if (page.state === 'loaded' && page.frame) {
-                this.#renderScrollPage(page)
+                if (!request || request.prepared.has(page.frame.iframe.contentDocument))
+                    rendering.push(this.#renderScrollPage(page, request))
             }
         }
         this.#updateScrollEndPadding()
         // Restore scroll position to keep current page in view after resize
         if (currentIndex >= 0 && currentIndex < this.#scrollPages.length) {
-            this.#scrollPages[currentIndex].el.scrollIntoView()
-            this.#scrollCurrentIndex = currentIndex
+            if (target) {
+                const page = target.page.el.getBoundingClientRect()
+                this.scrollTo({ top: this.scrollTop + page.top
+                    - this.getBoundingClientRect().top - this.clientTop
+                    + target.offset * page.height, behavior: 'instant' })
+            } else this.#scrollPages[currentIndex].el.scrollIntoView()
+            this.#scrollCurrentIndex = this.#getScrollIndex()
         }
         this.#scrollViewport = { width: this.clientWidth, height: this.clientHeight }
         this.#scrollPosition = this.scrollTop
         this.#syncPageSnapType()
+        return rendering
     }
-    #renderScrollPage(pageData) {
+    #scrollBy(distance) {
+        const top = Math.max(0, Math.min(this.scrollTop + distance,
+            this.scrollHeight - this.clientHeight))
+        const page = this.#scrollPages[this.#getScrollIndex(top)]
+        if (page) {
+            const bounds = page.el.getBoundingClientRect()
+            const pageTop = this.scrollTop + bounds.top
+                - this.getBoundingClientRect().top - this.clientTop
+            this.#scrollTarget = { page, offset: (top - pageTop) / bounds.height }
+        }
+        this.scrollBy({ top: distance, behavior: 'smooth' })
+    }
+    #renderScrollPage(pageData, request) {
+        if (!this.#isPresentationCurrent(request)) return false
         const { width: hostWidth, height: hostHeight } = this.getBoundingClientRect()
-        if (!hostWidth || !pageData.frame) return
+        if (!hostWidth || !pageData.frame) return false
         const { vpWidth: vw, vpHeight: vh, frame } = pageData
         const widthScale = hostWidth / vw
         const scale = (this.hasAttribute('page-snap') && this.#zoom !== 'fit-width'
@@ -707,7 +1019,7 @@ export class FixedLayout extends HTMLElement {
         if (pageData === this.#scrollPages.at(-1)) this.#updateScrollEndPadding()
 
         this.#syncPageSnapType()
-        return this.#renderFrameOverlayer(frame, scale)
+        return this.#renderFrameOverlayer(frame, scale, request)
     }
     #updateScrollEndPadding() {
         const last = this.#scrollPages.at(-1)?.el
@@ -763,6 +1075,7 @@ export class FixedLayout extends HTMLElement {
         else this.style.removeProperty('scroll-snap-type')
     }
     #beginPageGesture() {
+        this.#scrollTarget = null
         if (!this.hasAttribute('page-snap')) return
         this.style.scrollSnapType = 'none'
     }
@@ -919,12 +1232,13 @@ export class FixedLayout extends HTMLElement {
             return arr
         }, [{}])
     }
-    #respread(spreadMode) {
-        if (this.#index === -1) return
-        const section = this.book.sections[this.index]
+    #respread(spreadMode, request, sectionIndex) {
+        if (this.#index === -1 && sectionIndex === undefined) return
+        const section = this.book.sections[sectionIndex ?? this.index]
         this.#spread(spreadMode)
-        const { index } = this.getSpreadOf(section)
+        const { index, side } = this.getSpreadOf(section)
         this.#index = -1
+        this.#displayedSpread = -1
         this.#preloadCache.clear()
         for (const frames of this.#prerenderedSpreads.values()) {
             if (frames.center) {
@@ -937,7 +1251,7 @@ export class FixedLayout extends HTMLElement {
         this.#prerenderedSpreads.clear()
         this.#spreadAccessTime.clear()
         this.#overlayers.clear()
-        this.goToSpread(index, this.rtl ? 'right' : 'left', 'page')
+        return this.goToSpread(index, side, 'page', request)
     }
     get index() {
         if (this.#scrollMode) return this.#scrollCurrentIndex >= 0
@@ -953,6 +1267,7 @@ export class FixedLayout extends HTMLElement {
         return this.#pageColors
     }
     set pageColors(value) {
+        this.#interruptPresentation('superseded')
         this.#pageColors = value
         this.#render()
     }
@@ -992,47 +1307,69 @@ export class FixedLayout extends HTMLElement {
             if (center === section) return { index, side: 'center' }
         }
     }
-    async goToSpread(index, side, reason) {
-        if (index < 0 || index > this.#spreads.length - 1) return
+    async goToSpread(index, side, reason, request) {
+        if (!request) this.#interruptPresentation('superseded')
+        if (!this.#isPresentationCurrent(request)
+            || index < 0 || index > this.#spreads.length - 1) return
+        this.#side = side
         if (index === this.#index) {
-            this.#render(side)
+            await this.#spreadReady
+            if (!request && !this.#destroyed) await Promise.all(this.#render(side))
             return
         }
         this.#index = index
-        const spread = this.#spreads[index]
-        const cacheKey = `spread-${index}`
-        const cached = this.#preloadCache.get(cacheKey)
-        if (cached && cached !== 'loading') {
-            if (cached.center) {
-                const sectionIndex = this.book.sections.indexOf(spread.center)
-                await this.#showSpread({ center: { index: sectionIndex, src: cached.center }, spreadIndex: index, side })
-            } else {
-                const indexL = this.book.sections.indexOf(spread.left)
-                const indexR = this.book.sections.indexOf(spread.right)
-                const left = { index: indexL, src: cached.left }
-                const right = { index: indexR, src: cached.right }
-                await this.#showSpread({ left, right, side, spreadIndex: index })
-            }
-        } else {
-            if (spread.center) {
+        const generation = ++this.#spreadGeneration
+        const current = () => this.#isPresentationCurrent(request)
+            && this.#spreadGeneration === generation
+        const loading = (async () => {
+            const spread = this.#spreads[index]
+            const cacheKey = `spread-${index}`
+            const cached = this.#preloadCache.get(cacheKey)
+            let shown
+            if (cached && cached !== 'loading') {
+                if (cached.center) {
+                    const sectionIndex = this.book.sections.indexOf(spread.center)
+                    shown = await this.#showSpread({ center: { index: sectionIndex, src: cached.center },
+                        spreadIndex: index, side, request, generation })
+                } else {
+                    const indexL = this.book.sections.indexOf(spread.left)
+                    const indexR = this.book.sections.indexOf(spread.right)
+                    const left = { index: indexL, src: cached.left }
+                    const right = { index: indexR, src: cached.right }
+                    shown = await this.#showSpread({ left, right, side, spreadIndex: index, request, generation })
+                }
+            } else if (spread.center) {
                 const sectionIndex = this.book.sections.indexOf(spread.center)
                 const src = await spread.center?.load?.()
-                await this.#showSpread({ center: { index: sectionIndex, src }, spreadIndex: index, side })
+                if (!current()) return
+                shown = await this.#showSpread({ center: { index: sectionIndex, src },
+                    spreadIndex: index, side, request, generation })
             } else {
                 const indexL = this.book.sections.indexOf(spread.left)
                 const indexR = this.book.sections.indexOf(spread.right)
                 const srcL = await spread.left?.load?.()
+                if (!current()) return
                 const srcR = await spread.right?.load?.()
+                if (!current()) return
                 const left = { index: indexL, src: srcL }
                 const right = { index: indexR, src: srcR }
-                await this.#showSpread({ left, right, side, spreadIndex: index })
+                shown = await this.#showSpread({ left, right, side, spreadIndex: index, request, generation })
             }
+            if (!shown || !current()) return
+            if (!request) {
+                this.#reportLocation(reason)
+                this.#preloadNextSpreads()
+            }
+        })()
+        this.#spreadReady = loading
+        try {
+            await loading
+        } finally {
+            if (this.#spreadReady === loading) this.#spreadReady = Promise.resolve()
         }
-
-        this.#reportLocation(reason)
-        this.#preloadNextSpreads()
     }
     #preloadNextSpreads() {
+        if (this.#destroyed) return
         this.#cleanupPreloadCache()
 
         if (this.#numPrerenderedSpreads <= 0) return
@@ -1064,48 +1401,69 @@ export class FixedLayout extends HTMLElement {
     }
 
     async #processPreloadQueue() {
-        while (this.#preloadQueue.length > 0 && this.#activePreloads < this.#maxConcurrentPreloads) {
+        while (!this.#destroyed && this.#preloadQueue.length > 0
+            && this.#activePreloads < this.#maxConcurrentPreloads) {
             const task = this.#preloadQueue.shift()
             if (!task) break
 
-            const { spread, cacheKey } = task
+            const { spread, cacheKey, targetIndex } = task
+            const current = () => !this.#destroyed && this.#spreads[targetIndex] === spread
             this.#preloadCache.set(cacheKey, 'loading')
             this.#activePreloads++
             Promise.resolve().then(async () => {
                 try {
                     if (spread.center) {
                         const src = await spread.center?.load?.()
+                        if (!current()) return
                         this.#preloadCache.set(cacheKey, { center: src })
 
                         const sectionIndex = this.book.sections.indexOf(spread.center)
                         const frame = await this.#createFrame({ index: sectionIndex, src, detached: true })
+                        if (!current() || !frame) {
+                            frame?.element?.remove()
+                            return
+                        }
 
                         this.#prerenderedSpreads.set(cacheKey, { center: frame })
                         this.#spreadAccessTime.set(cacheKey, Date.now())
                         if (frame.onZoom) {
                             const doc = frame.iframe.contentDocument
-                            frame.onZoom({ doc, scale: this.#totalScaleFactor, pageColors: this.#pageColors })
+                            frame.onZoom({ doc, scale: this.#totalScaleFactor,
+                                pageColors: this.#pageColors, signal: this.#lifetime.signal })
                         }
                     } else {
                         const srcL = await spread.left?.load?.()
+                        if (!current()) return
                         const srcR = await spread.right?.load?.()
+                        if (!current()) return
                         this.#preloadCache.set(cacheKey, { left: srcL, right: srcR })
 
                         const indexL = this.book.sections.indexOf(spread.left)
                         const indexR = this.book.sections.indexOf(spread.right)
                         const leftFrame = await this.#createFrame({ index: indexL, src: srcL, detached: true })
+                        if (!current() || !leftFrame) {
+                            leftFrame?.element?.remove()
+                            return
+                        }
                         const rightFrame = await this.#createFrame({ index: indexR, src: srcR, detached: true })
+                        if (!current() || !rightFrame) {
+                            leftFrame.element?.remove()
+                            rightFrame?.element?.remove()
+                            return
+                        }
 
                         this.#prerenderedSpreads.set(cacheKey, { left: leftFrame, right: rightFrame })
                         this.#spreadAccessTime.set(cacheKey, Date.now())
 
                         if (leftFrame.onZoom) {
                             const docL = leftFrame.iframe.contentDocument
-                            leftFrame.onZoom({ doc: docL, scale: this.#totalScaleFactor, pageColors: this.#pageColors })
+                            leftFrame.onZoom({ doc: docL, scale: this.#totalScaleFactor,
+                                pageColors: this.#pageColors, signal: this.#lifetime.signal })
                         }
                         if (rightFrame.onZoom) {
                             const docR = rightFrame.iframe.contentDocument
-                            rightFrame.onZoom({ doc: docR, scale: this.#totalScaleFactor, pageColors: this.#pageColors })
+                            rightFrame.onZoom({ doc: docR, scale: this.#totalScaleFactor,
+                                pageColors: this.#pageColors, signal: this.#lifetime.signal })
                         }
                     }
                 } catch {
@@ -1166,7 +1524,10 @@ export class FixedLayout extends HTMLElement {
         // TODO
     }
     async goTo(target) {
+        this.#interruptPresentation('superseded')
+        this.#scrollTarget = null
         const resolved = await target
+        if (this.#destroyed) return
         if (this.#scrollMode) {
             const page = this.#scrollPages[resolved.index]
             if (page) {
@@ -1184,22 +1545,25 @@ export class FixedLayout extends HTMLElement {
         await this.goToSpread(index, side)
     }
     async next(distance) {
+        this.#interruptPresentation('superseded')
         if (this.#scrollMode) {
-            this.scrollBy({ top: distance || this.clientHeight, behavior: 'smooth' })
+            this.#scrollBy(distance || this.clientHeight)
             return
         }
         const s = this.rtl ? this.#goLeft() : this.#goRight()
         if (!s) return this.goToSpread(this.#index + 1, this.rtl ? 'right' : 'left', 'page')
     }
     async prev(distance) {
+        this.#interruptPresentation('superseded')
         if (this.#scrollMode) {
-            this.scrollBy({ top: -(distance || this.clientHeight), behavior: 'smooth' })
+            this.#scrollBy(-(distance || this.clientHeight))
             return
         }
         const s = this.rtl ? this.#goRight() : this.#goLeft()
         if (!s) return this.goToSpread(this.#index - 1, this.rtl ? 'left' : 'right', 'page')
     }
     nextSection() {
+        this.#scrollTarget = null
         if (!this.#scrollMode) return
         const currentIndex = this.#getScrollIndex()
         const nextIndex = Math.min(currentIndex + 1, this.#scrollPages.length - 1)
@@ -1207,6 +1571,7 @@ export class FixedLayout extends HTMLElement {
         this.#scrollCurrentIndex = nextIndex
     }
     prevSection() {
+        this.#scrollTarget = null
         if (!this.#scrollMode) return
         const currentIndex = this.#getScrollIndex()
         const prevIndex = Math.max(currentIndex - 1, 0)
@@ -1215,6 +1580,7 @@ export class FixedLayout extends HTMLElement {
     }
     async pan(dx, dy) {
         if (this.#scrollMode) {
+            this.#scrollTarget = null
             this.scrollBy({ top: dy, left: dx, behavior: 'auto' })
             return
         }
@@ -1303,6 +1669,12 @@ export class FixedLayout extends HTMLElement {
         return this.#scrollMode ? 'height' : 'width'
     }
     destroy() {
+        this.#scrollTarget = null
+        this.#interruptPresentation('cancelled')
+        this.#destroyed = true
+        this.#lifetime.abort()
+        this.#spreadGeneration++
+        this.#preloadQueue = []
         if (this.#pageGestureTimer) clearTimeout(this.#pageGestureTimer)
         this.#observer.unobserve(this)
         if (this.#scrollMode) {

@@ -482,8 +482,8 @@ class View {
         if (!layout || !this.document?.documentElement) return
         this.#column = layout.flow !== 'scrolled'
         this.#layout = layout
-        if (this.#column) this.columnize(layout)
-        else this.scrolled(layout)
+        if (this.#column) return this.columnize(layout)
+        return this.scrolled(layout)
     }
     scrolled({ width, height, marginTop, marginRight, marginBottom, marginLeft, gap, columnWidth }) {
         const vertical = this.#vertical
@@ -517,7 +517,7 @@ class View {
             'position': 'static',
         })
         this.setImageSize(availableWidth, availableHeight)
-        this.expand()
+        return this.expand()
     }
     columnize({ width, height, marginTop, marginRight, marginBottom, marginLeft, gap, columnWidth, columnCount }) {
         const vertical = this.#vertical
@@ -571,7 +571,7 @@ class View {
             'position': 'static',
         })
         this.setImageSize(availableWidth, availableHeight)
-        this.expand()
+        return this.expand()
     }
     setImageSize(availableWidth, availableHeight) {
         const { width, height, marginTop, marginRight, marginBottom, marginLeft } = this.#layout
@@ -638,6 +638,9 @@ class View {
         if (this.#column) {
             const side = this.#vertical ? 'height' : 'width'
             const otherSide = this.#vertical ? 'width' : 'height'
+            const columnSize = this.#size / this.#columnCount
+            // One column per "page" — overflow columns extend into adjacent pages
+            documentElement.style[side] = `${columnSize}px`
             const contentRect = this.#contentRange.getBoundingClientRect()
             const rootRect = documentElement.getBoundingClientRect()
             // offset caused by column break at the start of the page
@@ -648,7 +651,6 @@ class View {
             // Size content by individual columns, not full spreads.
             // This allows adjacent sections to share a spread when a
             // section doesn't fill all available columns.
-            const columnSize = this.#size / this.#columnCount
             const pageCount = Math.ceil(contentSize / columnSize)
             this.#contentPages = pageCount
             const expandedSize = pageCount * columnSize
@@ -657,8 +659,6 @@ class View {
             this.#element.style[side] = `${expandedSize}px`
             this.#iframe.style[otherSide] = '100%'
             this.#element.style[otherSide] = '100%'
-            // One column per "page" — overflow columns extend into adjacent pages
-            documentElement.style[side] = `${columnSize}px`
             if (this.#overlayer) {
                 this.#overlayer.element.style.margin = '0'
                 this.#overlayer.element.style.left = '0'
@@ -696,7 +696,7 @@ class View {
                 this.#overlayer.redraw()
             }
         }
-        if (mayReanchor) this.onExpand()
+        if (mayReanchor) return this.onExpand()
     }
     set overlayer(overlayer) {
         this.#overlayer = overlayer
@@ -876,7 +876,7 @@ export class Paginator extends HTMLElement {
     static observedAttributes = [
         'flow', 'gap', 'margin-top', 'margin-bottom', 'margin-left', 'margin-right',
         'max-inline-size', 'max-block-size', 'max-column-count',
-        'no-preload', 'no-continuous-scroll',
+        'no-preload', 'no-continuous-scroll', 'animated', 'eink',
     ]
     #root = this.attachShadow({ mode: 'open' })
     #observer = new ResizeObserver(() => this.render())
@@ -914,6 +914,9 @@ export class Paginator extends HTMLElement {
     #stabilizing = false // true while #display is stabilizing layout
     #rendered = false // true after first #display completes
     #destroyed = false
+    #presentation = null
+    #batchingPresentation = false
+    #sectionLoads = new Map()
     constructor() {
         super()
         this.#root.innerHTML = `<style>
@@ -1178,9 +1181,10 @@ export class Paginator extends HTMLElement {
         return this.#primaryIndex
     }
     attributeChangedCallback(name, _, value) {
+        if (!this.#batchingPresentation) this.#interruptPresentation('superseded')
         switch (name) {
             case 'flow':
-                this.render()
+                if (!this.#batchingPresentation) this.render()
                 break
             case 'gap':
             case 'margin-top':
@@ -1190,15 +1194,15 @@ export class Paginator extends HTMLElement {
             case 'max-block-size':
             case 'max-column-count':
                 this.#top.style.setProperty('--_' + name, value)
-                this.render()
+                if (!this.#batchingPresentation) this.render()
                 break
             case 'max-inline-size':
                 // needs explicit `render()` as it doesn't necessarily resize
                 this.#top.style.setProperty('--_' + name, value)
-                this.render()
+                if (!this.#batchingPresentation) this.render()
                 break
             case 'no-continuous-scroll':
-                if (this.noContinuousScroll) {
+                if (!this.#batchingPresentation && this.noContinuousScroll) {
                     for (const [i] of this.#views) {
                         if (i !== this.#primaryIndex) this.#destroyView(i)
                     }
@@ -1232,7 +1236,7 @@ export class Paginator extends HTMLElement {
         const canReanchor = () => {
             // Only the primary view's resize should adjust scroll;
             // non-primary views (preloaded/adjacent) must not scroll
-            if (this.#filling || this.#stabilizing) return false
+            if (this.#filling || this.#stabilizing || this.#presentation) return false
             // WebKit may finish iframe reflow after render() positioned the
             // anchor. Correct that delayed layout while still anchored;
             // ordinary Scroll expansion must not move a user's position.
@@ -1244,7 +1248,7 @@ export class Paginator extends HTMLElement {
             container: this,
             canReanchor,
             onExpand: () => {
-                if (canReanchor()) this.#scrollToAnchor(this.#anchor, 'reflow')
+                if (canReanchor()) return this.#scrollToAnchor(this.#anchor, 'reflow')
             },
         })
         this.#views.set(index, view)
@@ -1446,15 +1450,17 @@ export class Paginator extends HTMLElement {
             vertical: this.#vertical,
             rtl: this.#rtl,
         })
+        const work = []
         for (const [, view] of this.#views) {
-            if (view.document) view.render(layout)
+            if (view.document) work.push(view.render(layout))
         }
         // Scroll synchronously to prevent visible layout shift during resize.
         // RAF deferral is only needed for initial display and mode switches
         // (handled by #display), not for resize re-renders.
-        this.#scrollToAnchor(this.#anchor, 'reflow', false, true)
+        const anchor = this.#scrollToAnchor(this.#anchor, 'reflow', false, true)
         this.#stabilizing = false
         this.dispatchEvent(new Event('stabilized'))
+        return Promise.all([...work, anchor])
     }
     get scrolled() {
         return this.getAttribute('flow') === 'scrolled'
@@ -2065,7 +2071,16 @@ export class Paginator extends HTMLElement {
         this.#fillPromise.then(() => { this.#stabilizing = false })
     }
     // Load an adjacent section without changing primary index
-    async #loadAdjacentSection(index) {
+    #loadAdjacentSection(index) {
+        const pending = this.#sectionLoads.get(index)
+        if (pending) return pending
+        const load = this.#loadAdjacentSectionContent(index).finally(() => {
+            if (this.#sectionLoads.get(index) === load) this.#sectionLoads.delete(index)
+        })
+        this.#sectionLoads.set(index, load)
+        return load
+    }
+    async #loadAdjacentSectionContent(index) {
         if (this.#views.has(index) || !this.#canGoToIndex(index)) return
         const section = this.sections[index]
         if (!section || section.linear === 'no') return
@@ -2085,7 +2100,7 @@ export class Paginator extends HTMLElement {
                         prop => doc.documentElement.setAttribute('data-' + prop, ''))
                     this.#styleMap.set(doc, [$styleBefore, $style])
                 }
-                this.setStyles(this.#styles)
+                this.#setStyles(this.#styles, this.#presentation)
                 this.dispatchEvent(new CustomEvent('load', { detail: { doc, index } }))
             }
             const beforeRender = this.#beforeRender.bind(this)
@@ -2148,7 +2163,7 @@ export class Paginator extends HTMLElement {
                 await this.#loadAdjacentSection(nextIdx)
                 if (!this.#views.has(nextIdx)) break
             }
-            if (reanchor) this.#scrollToAnchor(this.#anchor, 'reflow')
+            if (reanchor) await this.#scrollToAnchor(this.#anchor, 'reflow')
         } finally {
             this.#filling = false
         }
@@ -2229,7 +2244,7 @@ export class Paginator extends HTMLElement {
             const onLoad = detail => {
                 if (oldIndex >= 0 && !this.#views.has(oldIndex))
                     this.sections[oldIndex]?.unload?.()
-                this.setStyles(this.#styles)
+                this.#setStyles(this.#styles, this.#presentation)
                 this.dispatchEvent(new CustomEvent('load', { detail }))
             }
             await this.#display(Promise.resolve(this.sections[index].load())
@@ -2389,10 +2404,12 @@ export class Paginator extends HTMLElement {
         }
         return contents
     }
-    setStyles(styles) {
+    #setStyles(styles, request) {
         this.#styles = styles
+        const work = []
         for (const [, view] of this.#views) {
-            const $$styles = this.#styleMap.get(view.document)
+            const doc = view.document
+            const $$styles = this.#styleMap.get(doc)
             if (!$$styles) continue
             const [$beforeStyle, $style] = $$styles
             if (Array.isArray(styles)) {
@@ -2402,14 +2419,202 @@ export class Paginator extends HTMLElement {
             } else $style.textContent = styles
 
             // needed because the resize observer doesn't work in Firefox
-            view.document?.fonts?.ready?.then(() => view.expand())
+            // Reading geometry starts the current registered font work. A
+            // selected font not registered by the host cannot be inferred here.
+            if (!request) doc.documentElement.getBoundingClientRect()
+            if (!request) work.push(doc.fonts?.ready?.then(() => {
+                if (!this.#destroyed && view.document === doc) return view.expand()
+            }))
         }
 
         // NOTE: needs `requestAnimationFrame` in Chromium
         const primaryView = this.#primaryView
-        if (primaryView) {
-            requestAnimationFrame(() => this.#replaceBackground())
+        if (primaryView && !request) {
+            work.push(new Promise(resolve => requestAnimationFrame(() => {
+                if (!this.#destroyed) this.#replaceBackground()
+                resolve()
+            })))
         }
+        return Promise.all(work)
+    }
+    setStyles(styles) {
+        this.#interruptPresentation('superseded')
+        return this.#setStyles(styles)
+    }
+    #interruptPresentation(outcome) {
+        const request = this.#presentation
+        if (!request) return
+        this.#presentation = null
+        request.outcome = outcome
+        request.controller.abort()
+        request.interrupt(outcome)
+        for (const cancel of request.callbacks) cancel()
+        request.callbacks.clear()
+    }
+    get #hasPresentationViewport() {
+        const { width, height } = this.#container.getBoundingClientRect()
+        const host = this.getBoundingClientRect()
+        return width > 0 && height > 0 && host.width > 0 && host.height > 0
+    }
+    async applyPresentation(presentation, signal) {
+        this.#interruptPresentation('superseded')
+        if (this.#destroyed || signal.aborted) return 'cancelled'
+        let interrupt
+        const interrupted = new Promise(resolve => { interrupt = resolve })
+        const request = {
+            interrupt, callbacks: new Set(), outcome: null,
+            controller: new AbortController(),
+            prepareDocument: presentation.prepareDocument,
+        }
+        const current = () => this.#presentation === request
+            && !signal.aborted && !this.#destroyed
+        const abort = () => {
+            if (this.#presentation === request) this.#interruptPresentation('cancelled')
+        }
+        this.#presentation = request
+        signal.addEventListener('abort', abort, { once: true })
+        try {
+            this.#batchingPresentation = true
+            try {
+                for (const [name, value] of Object.entries(presentation.attributes)) {
+                    if (!Paginator.observedAttributes.includes(name))
+                        throw new TypeError(`Unsupported paginator presentation attribute: ${name}`)
+                    if (value === null) this.removeAttribute(name)
+                    else this.setAttribute(name, value)
+                }
+            } finally {
+                this.#batchingPresentation = false
+            }
+            if (this.noContinuousScroll) {
+                for (const [index] of this.#views)
+                    if (index !== this.#primaryIndex) this.#destroyView(index)
+            }
+            this.#setStyles(presentation.styles ?? this.#styles, request)
+            if (!this.#primaryView?.document || !this.#hasPresentationViewport) return 'unavailable'
+            const work = this.#settlePresentation(request, current)
+            const outcome = await Promise.race([work, interrupted])
+            return request.outcome ?? outcome
+        } catch (error) {
+            if (request.outcome) return request.outcome
+            throw error
+        } finally {
+            signal.removeEventListener('abort', abort)
+            if (this.#presentation === request) this.#presentation = null
+            request.controller.abort()
+            for (const cancel of request.callbacks) cancel()
+            request.callbacks.clear()
+        }
+    }
+    async #settlePresentation(request, current) {
+        const prepared = new Map()
+        const prepare = doc => {
+            if (!prepared.has(doc)) prepared.set(doc, Promise.resolve().then(() => {
+                if (current()) return request.prepareDocument?.(doc, request.controller.signal)
+            }))
+            return prepared.get(doc)
+        }
+        const requiredViews = () => {
+            const required = []
+            let offset = 0
+            for (const [index, view] of this.#sortedViews) {
+                if (view.document && (index <= this.#primaryIndex || offset < this.#renderedEnd))
+                    required.push(view)
+                offset += view.element.getBoundingClientRect()[this.sideProp]
+            }
+            return required
+        }
+        const expandCurrent = async () => {
+            if (!current()) return
+            // The primary and preceding documents are required in either flow.
+            await Promise.all(this.#sortedViews
+                .filter(([index, view]) => index <= this.#primaryIndex && view.document)
+                .map(([, view]) => prepare(view.document)))
+            if (!current()) return
+            const layout = this.#beforeRender({ vertical: this.#vertical, rtl: this.#rtl })
+            const rendered = []
+            for (const [, view] of this.#views) {
+                if (view.document) rendered.push(view.render(layout))
+            }
+            await Promise.all(rendered)
+            if (!current()) return
+            const loads = []
+            const loadingViews = []
+            let pendingOffset = 0
+            for (const [index, view] of this.#sortedViews) {
+                const pending = this.#sectionLoads.get(index)
+                if (pending && (index <= this.#primaryIndex || pendingOffset < this.#renderedEnd)) {
+                    loads.push(pending)
+                    loadingViews.push(view)
+                }
+                pendingOffset += view.element.getBoundingClientRect()[this.sideProp]
+            }
+            await Promise.all(loads)
+            if (!current()) return
+            if (loadingViews.some(view => !view.document)) return false
+            const ready = new Set()
+            while (current()) {
+                const required = requiredViews().filter(view => !ready.has(view.document))
+                if (!required.length) break
+                await Promise.all(required.map(view => prepare(view.document)))
+                if (!current()) return
+                await Promise.all(required.map(async view => {
+                    const doc = view.document
+                    await view.render(layout)
+                    await doc.fonts?.ready
+                    if (current() && view.document === doc) {
+                        await view.expand(false)
+                        ready.add(doc)
+                    }
+                }))
+            }
+            return true
+        }
+        if (await expandCurrent() === false) return 'unavailable'
+        if (!current()) return 'superseded'
+        // Only loads that contribute geometry before or inside the viewport
+        // belong to this operation. Forward preloading keeps its own lifetime.
+        if (!this.noPreload && !this.noContinuousScroll) {
+            const primary = this.#primaryView
+            const firstIndex = this.#sortedViews[0]?.[0]
+            if (firstIndex != null && primary && (this.scrolled
+                || (primary.contentPages > 0 && primary.contentPages < this.columnCount))) {
+                const previous = this.#adjacentIndex(-1, firstIndex)
+                if (previous != null) {
+                    await this.#loadAdjacentSection(previous)
+                    if (current() && !this.#views.get(previous)?.document) return 'unavailable'
+                }
+            }
+            if (!current()) return 'superseded'
+            if (await expandCurrent() === false) return 'unavailable'
+            while (current() && this.#views.size < 8 && this.#renderedViewSize < this.#renderedEnd) {
+                const lastIndex = this.#sortedViews.at(-1)?.[0]
+                const next = lastIndex == null ? null : this.#adjacentIndex(1, lastIndex)
+                if (next == null) break
+                await this.#loadAdjacentSection(next)
+                if (!current()) return 'superseded'
+                if (!this.#views.get(next)?.document) return 'unavailable'
+                if (await expandCurrent() === false) return 'unavailable'
+            }
+        }
+        if (!current()) return 'superseded'
+        if (!this.#primaryView?.document || !this.#hasPresentationViewport) return 'unavailable'
+        await this.render()
+        if (!current()) return 'superseded'
+        await new Promise(resolve => {
+            let frame
+            const cancel = () => {
+                cancelAnimationFrame(frame)
+                request.callbacks.delete(cancel)
+                resolve()
+            }
+            frame = requestAnimationFrame(() => {
+                request.callbacks.delete(cancel)
+                if (current()) this.#replaceBackground()
+                resolve()
+            })
+            request.callbacks.add(cancel)
+        })
+        return current() ? 'applied' : 'superseded'
     }
     focusView() {
         this.#primaryView?.document?.defaultView?.focus()
@@ -2424,7 +2629,9 @@ export class Paginator extends HTMLElement {
         this.#primaryView?.destroyLoupe()
     }
     destroy() {
+        this.#interruptPresentation('cancelled')
         this.#destroyed = true
+        this.#sectionLoads.clear()
         if (this.#wheelTimer) clearTimeout(this.#wheelTimer)
         this.#observer.disconnect()
         this.#destroyAllViews()

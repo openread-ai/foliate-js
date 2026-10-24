@@ -137,8 +137,8 @@ const setupPanningEvents = (doc) => {
     container.style.cursor = 'grab'
 }
 
-const render = async (page, doc, zoom, pageColors, prepareText) => {
-    if (!doc) return
+const render = async (page, doc, zoom, pageColors, prepareText, signal) => {
+    if (!doc || signal?.aborted) return { status: 'cancelled' }
 
     // Increment generation to invalidate any in-progress render for this doc
     const generation = (renderGenerations.get(doc) || 0) + 1
@@ -168,32 +168,39 @@ const render = async (page, doc, zoom, pageColors, prepareText) => {
     const canvasContext = canvas.getContext('2d')
     const renderTask = page.render({ canvasContext, viewport, pageColors })
     activeRenderTasks.set(doc, renderTask)
+    const cancel = () => renderTask.cancel()
+    signal?.addEventListener('abort', cancel, { once: true })
+    if (signal?.aborted) cancel()
+    const current = () => !signal?.aborted
+        && renderGenerations.get(doc) === generation && !!doc.defaultView
 
     try {
         await renderTask.promise
-    } catch {
+    } catch (error) {
         // Render was cancelled or failed — release canvas bitmap memory
         canvas.width = 0
         canvas.height = 0
-        return
+        return !current() || error instanceof pdfjsLib.RenderingCancelledException
+            ? { status: 'cancelled' } : { status: 'failed', error }
     } finally {
+        signal?.removeEventListener('abort', cancel)
         if (activeRenderTasks.get(doc) === renderTask) {
             activeRenderTasks.delete(doc)
         }
     }
 
     // Bail out if a newer render has started or iframe was removed
-    if (renderGenerations.get(doc) !== generation || !doc.defaultView) {
+    if (!current()) {
         canvas.width = 0
         canvas.height = 0
-        return
+        return { status: 'cancelled' }
     }
 
     const canvasElement = doc.querySelector('#canvas')
     if (!canvasElement) {
         canvas.width = 0
         canvas.height = 0
-        return
+        return { status: 'cancelled' }
     }
 
     // Release old canvas bitmap memory before replacing
@@ -276,17 +283,23 @@ const render = async (page, doc, zoom, pageColors, prepareText) => {
             display: 'none',
         })
 
-    // Clear annotation layer before re-rendering to prevent DOM accumulation
-    const div = doc.querySelector('.annotationLayer')
-    div.replaceChildren()
+    // Stage annotations in this document so interrupted async work cannot
+    // replace or mutate the current attached annotation layer.
+    const annotations = await page.getAnnotations()
+    if (!current()) return { status: 'cancelled' }
+    const previousAnnotations = doc.querySelector('.annotationLayer')
+    const div = previousAnnotations.cloneNode(false)
     const linkService = {
         goToDestination: () => {},
         getDestinationHash: dest => JSON.stringify(dest),
         addLinkAttributes: (link, url) => link.href = url,
     }
     await new pdfjsLib.AnnotationLayer({ page, viewport, div, linkService }).render({
-        annotations: await page.getAnnotations(),
+        annotations,
     })
+    if (!current()) return { status: 'cancelled' }
+    previousAnnotations.replaceWith(div)
+    return { status: 'rendered' }
 }
 
 const renderPage = async (page, getImageBlob, prepareText) => {
@@ -330,7 +343,8 @@ const renderPage = async (page, getImageBlob, prepareText) => {
         <div class="annotationLayer"></div>
     `
     const src = URL.createObjectURL(new Blob([data], { type: 'text/html' }))
-    const onZoom = ({ doc, scale, pageColors }) => render(page, doc, scale, pageColors, prepareText)
+    const onZoom = ({ doc, scale, pageColors, signal }) =>
+        render(page, doc, scale, pageColors, prepareText, signal)
     return { src, data, onZoom }
 }
 
