@@ -172,6 +172,13 @@ try {
             if (held) { entered.resolve(); await held.promise }
         })])
         await navigation
+        await new Promise(resolve => {
+            const observer = new ResizeObserver(() => {
+                observer.disconnect()
+                resolve()
+            })
+            observer.observe(reader)
+        })
         held = deferred()
         const controller = new AbortController()
         const pending = apply(reader, {}, {}, controller.signal)
