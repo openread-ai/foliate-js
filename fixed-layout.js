@@ -1066,9 +1066,21 @@ export class FixedLayout extends HTMLElement {
     }
     #listenForPageGestures(doc) {
         doc.addEventListener('wheel', event => {
-            if (event.deltaY && !event.ctrlKey && !event.metaKey
-                && !event.shiftKey && !event.altKey) event.preventDefault()
-            this.handleWheel(event.deltaX, event.deltaY)
+            const unmodified = !event.ctrlKey && !event.metaKey
+                && !event.shiftKey && !event.altKey
+            if (unmodified && !this.#scrollMode && this.#isOverflowY) return
+            const scrolling = unmodified && this.#scrollMode
+            const deltaMode = scrolling ? event.deltaMode : WheelEvent.DOM_DELTA_PIXEL
+            let deltaY = event.deltaY
+            if (scrolling) {
+                if (deltaMode === WheelEvent.DOM_DELTA_PAGE) deltaY *= this.clientHeight
+                else if (deltaMode === WheelEvent.DOM_DELTA_LINE) {
+                    const style = getComputedStyle(this)
+                    deltaY *= parseFloat(style.lineHeight) || parseFloat(style.fontSize) * 1.2
+                }
+                if (deltaY) event.preventDefault()
+            }
+            this.handleWheel(event.deltaX, deltaY)
         }, { passive: false })
         doc.addEventListener('touchstart', this.#onPageTouchStart, { passive: true })
         doc.addEventListener('touchmove', this.#onPageTouchMove, { passive: false })

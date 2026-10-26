@@ -1,0 +1,31 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Fixed-layout wheel overflow</title>
+<style>
+  html, body { margin: 0; overflow: hidden }
+  #host { width: 600px; height: 400px }
+</style>
+<div id="host"></div>
+<script type="module">
+  import { FixedLayout } from '../fixed-layout.js'
+
+  const reader = new FixedLayout()
+  document.querySelector('#host').append(reader)
+  reader.open({
+    rendition: { spread: 'none', viewport: { width: 600, height: 1200 } },
+    sections: [{
+      pageSpread: 'center',
+      load: async () => ({ src: 'about:blank', data: `<!doctype html>
+        <meta name="viewport" content="width=600,height=1200">
+        <body style="margin:0;height:1200px;background:linear-gradient(white,lightblue)">
+          <p>Top passage</p><p style="margin-top:700px">Lower passage</p>
+        </body>` }),
+    }],
+  })
+  await reader.goTo({ index: 0 })
+  const outcome = await reader.applyPresentation({
+    attributes: { spread: 'none', zoom: 'fit-width', flow: 'paginated' },
+  }, new AbortController().signal)
+  if (outcome !== 'applied') throw new Error(`Presentation failed: ${outcome}`)
+  document.documentElement.dataset.wheelReady = 'true'
+</script>
