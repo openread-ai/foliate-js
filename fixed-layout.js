@@ -936,7 +936,15 @@ export class FixedLayout extends HTMLElement {
         const resized = this.#scrollViewport
             && (this.#scrollViewport.width !== this.clientWidth
                 || this.#scrollViewport.height !== this.clientHeight)
-        const target = this.#scrollTarget
+        let target = this.#scrollTarget
+        if (!target && this.#scrollViewport && (request || resized)) {
+            const position = resized ? this.#scrollPosition : this.scrollTop
+            const page = this.#scrollPages[this.#getScrollIndex(position)]
+            const bounds = page?.el.getBoundingClientRect()
+            if (bounds?.height) target = { page, offset:
+                (position - this.scrollTop + this.getBoundingClientRect().top
+                    + this.clientTop - bounds.top) / bounds.height }
+        }
         const currentIndex = target ? target.page.index : targetIndex >= 0 ? targetIndex
             : this.#getScrollIndex(resized ? this.#scrollPosition : this.scrollTop)
         for (const page of this.#scrollPages) {
@@ -1057,8 +1065,23 @@ export class FixedLayout extends HTMLElement {
             { reason, range: null, index, fraction: 0, size: 1 } }))
     }
     #listenForPageGestures(doc) {
-        doc.addEventListener('wheel', e => this.handleWheel(e.deltaX, e.deltaY),
-            { passive: true })
+        doc.addEventListener('wheel', event => {
+            const unmodified = !event.ctrlKey && !event.metaKey
+                && !event.shiftKey && !event.altKey
+            if (unmodified && !this.#scrollMode && this.#isOverflowY) return
+            const scrolling = unmodified && this.#scrollMode
+            const deltaMode = scrolling ? event.deltaMode : WheelEvent.DOM_DELTA_PIXEL
+            let deltaY = event.deltaY
+            if (scrolling) {
+                if (deltaMode === WheelEvent.DOM_DELTA_PAGE) deltaY *= this.clientHeight
+                else if (deltaMode === WheelEvent.DOM_DELTA_LINE) {
+                    const style = getComputedStyle(this)
+                    deltaY *= parseFloat(style.lineHeight) || parseFloat(style.fontSize) * 1.2
+                }
+                if (deltaY) event.preventDefault()
+            }
+            this.handleWheel(event.deltaX, deltaY)
+        }, { passive: false })
         doc.addEventListener('touchstart', this.#onPageTouchStart, { passive: true })
         doc.addEventListener('touchmove', this.#onPageTouchMove, { passive: false })
         doc.addEventListener('touchend', this.#onPageTouchEnd)

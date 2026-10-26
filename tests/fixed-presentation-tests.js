@@ -10,6 +10,13 @@ const deferred = () => {
     return { promise, resolve }
 }
 const task = () => new Promise(resolve => setTimeout(resolve, 0))
+const waitFor = async predicate => {
+    const deadline = performance.now() + 10_000
+    while (!predicate()) {
+        assert(performance.now() < deadline, 'The actual deferred result must become ready')
+        await task()
+    }
+}
 const assertPending = async (promise, message) => {
     let settled = false
     promise.then(() => { settled = true }, () => { settled = true })
@@ -31,6 +38,7 @@ const makeReader = (sections = [section(0)], { index = 0, book } = {}) => {
     const reader = new FixedLayout()
     host.append(reader)
     document.body.append(host)
+    host.scrollIntoView()
     const overlays = []
     reader.addEventListener('create-overlayer', event => {
         const element = document.createElement('div')
@@ -64,6 +72,9 @@ const pdfBytes = () => {
         `<< /Length ${stream.length} >>\nstream\n${stream}\nendstream`,
         '<< /Type /Annot /Subtype /Link /Rect [40 150 240 200] /Border [0 0 0] /A << /S /URI /URI (https://openread.example/owned) >> >>',
     ]
+    return encodePDF(objects)
+}
+const encodePDF = objects => {
     let source = '%PDF-1.4\n'
     const offsets = [0]
     objects.forEach((object, index) => {
@@ -76,12 +87,22 @@ const pdfBytes = () => {
     source += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`
     return new TextEncoder().encode(source)
 }
+const scannedPDFBytes = () => {
+    const stream = 'q 300 0 0 240 0 0 cm /Im1 Do Q'
+    return encodePDF([
+        '<< /Type /Catalog /Pages 2 0 R >>',
+        '<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R] /Count 3 >>',
+        ...[0, 1, 2].map(() => '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 240] /Resources << /XObject << /Im1 6 0 R >> >> /Contents 7 0 R >>'),
+        '<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /ASCIIHexDecode /Length 7 >>\nstream\n507090>\nendstream',
+        `<< /Length ${stream.length} >>\nstream\n${stream}\nendstream`,
+    ])
+}
 const makePDFReader = async () => {
     const book = await makePDF(new File([pdfBytes()], 'presentation.pdf', { type: 'application/pdf' }))
     books.add(book)
     const value = makeReader(undefined, { book })
     await value.navigation
-    assert(await apply(value.reader) === 'applied', 'The initial PDF presentation must actually settle')
+    assert(await apply(value.reader, { spread: 'none' }) === 'applied', 'The initial PDF presentation must actually settle')
     const { doc } = value.reader.getContents().find(item => item.index === 0)
     assert(doc.querySelector('#canvas canvas')?.width > 0, 'Initial actual PDF raster must exist')
     return { ...value, doc }
@@ -102,6 +123,127 @@ const run = async (name, body) => {
 
 document.documentElement.dataset.fixedPresentationStatus = 'running'
 try {
+    await run('offscreen PDF text waits for visible text and retains lookahead', async () => {
+        const book = await makePDF(new File([scannedPDFBytes()], 'scanned.pdf'))
+        books.add(book)
+        const entered = deferred()
+        const release = deferred()
+        const requests = []
+        book.configureTextRecognition({ dispose() {}, get: async request => {
+            requests.push({ index: request.pageIndex, priority: request.priority })
+            const image = await request.rasterize(request.signal)
+            assert(image.size > 0, 'Scheduling proof must rasterize the actual scanned page')
+            if (request.pageIndex === 0) { entered.resolve(); await release.promise }
+            return { version: 2, revision: 'a'.repeat(64), width: 300, height: 240,
+                words: [{ text: 'Ready', block: 0, line: 0, quad: {
+                    x1: .1, y1: .1, x2: .3, y2: .1, x3: .3, y3: .2, x4: .1, y4: .2,
+                } }] }
+        } })
+        try {
+            const { reader, navigation } = makeReader(undefined, { book })
+            await navigation
+            await apply(reader, { spread: 'none', flow: 'scrolled', zoom: 'fit-width' })
+            await entered.promise
+            await waitFor(() => reader.getContents().some(item => item.index === 1
+                && item.doc.querySelector('#canvas canvas')?.width > 0))
+            await new Promise(resolve => setTimeout(resolve, 300))
+            assert(requests.length > 0 && requests.every(item => item.index === 0
+                && item.priority === 'visible'),
+            'Buffered pages must not begin recognition ahead of the held visible text')
+            release.resolve()
+            await waitFor(() => requests.some(item => item.index === 1 && item.priority === 'prefetch'))
+            const { doc } = reader.getContents().find(item => item.index === 0)
+            await waitFor(() => doc.querySelector('.textLayer span')?.textContent === 'Ready')
+            assert(requests.filter(item => item.index !== 0).every(item => item.priority === 'prefetch'),
+                'Offscreen lookahead must retain its lower recognition priority')
+        } finally {
+            release.resolve()
+        }
+    })
+    for (const format of ['PDF', 'fixed']) {
+        await run(`${format} sidebar resize retains the passage within the page`, async () => {
+            const value = format === 'PDF' ? await makePDFReader() : makeReader()
+            const { reader, host } = value
+            await value.navigation
+            await apply(reader, { flow: 'scrolled', zoom: 'fit-width' })
+            await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))
+            await reader.pan(0, 40)
+            await new Promise(resolve => setTimeout(resolve, 200))
+            const page = reader.shadowRoot.querySelector('.scroll-page')
+            const fraction = () => (reader.getBoundingClientRect().top
+                - page.getBoundingClientRect().top) / page.getBoundingClientRect().height
+            const before = fraction()
+            assert(before > 0, 'Input must reach a passage inside the actual page')
+            host.style.width = '1100px'
+            await new Promise(resolve => setTimeout(resolve, 200))
+            assert(Math.abs(fraction() - before) < .003,
+                'Sidebar width changes must retain the same passage after deferred resize work')
+            await apply(reader)
+            await new Promise(resolve => setTimeout(resolve, 200))
+            assert(Math.abs(fraction() - before) < .003,
+                'Late presentation after sidebar resize must also retain the passage')
+            host.style.width = '850px'
+            await new Promise(resolve => setTimeout(resolve, 200))
+            assert(Math.abs(fraction() - before) < .003,
+                'Opening the sidebar must retain the passage when it remains scrollable')
+        })
+        await run(`${format} document presentation preserves the in-page scroll position`, async () => {
+            const value = format === 'PDF' ? await makePDFReader() : makeReader()
+            const { reader } = value
+            await value.navigation
+            assert(await apply(reader, { flow: 'scrolled', zoom: 'fit-width' }) === 'applied',
+                'The actual scrolling page must settle before input')
+            await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))
+            const scrolled = new Promise(resolve => reader.addEventListener('relocate', event => {
+                if (event.detail.reason === 'scroll') resolve()
+            }))
+            await reader.pan(0, 40)
+            await scrolled
+            const before = reader.scrollTop
+            assert(before >= 40, 'Actual input must move within the rendered page')
+            assert(await apply(reader, {}, { styles: 'body { color: rgb(1, 2, 3); }' }) === 'applied',
+                'Late document presentation must finish its actual work')
+            await new Promise(resolve => setTimeout(resolve, 200))
+            assert(Math.abs(reader.scrollTop - before) < 1,
+                'Preparing the document must not jump back to the start of its page')
+            const { doc } = reader.getContents().find(item => item.index === 0)
+            assert(doc.defaultView.getComputedStyle(doc.body).color === 'rgb(1, 2, 3)',
+                'Preserving position must still apply the requested document styles')
+        })
+    }
+    await run('unchanged PDF presentation retains the completed canvas, text and links', async () => {
+        const { reader, doc } = await makePDFReader()
+        await new Promise(resolve => {
+            if (doc.querySelector('.textLayer span')) resolve()
+            else doc.addEventListener('pdf-text-ready', resolve, { once: true })
+        })
+        const canvas = doc.querySelector('#canvas canvas')
+        const text = doc.querySelector('.textLayer span')
+        const link = doc.querySelector('.annotationLayer a')
+        assert(canvas.width > 0 && text && link, 'Actual PDF raster, text and link must exist')
+        const selection = doc.getSelection()
+        const range = doc.createRange()
+        range.selectNodeContents(text)
+        selection.addRange(range)
+        const selected = selection.toString()
+        assert(selected.length > 0, 'Select actual embedded PDF text before presentation')
+        await apply(reader, {}, { styles: 'body { color: rgb(1, 2, 3); }' })
+        await new Promise(resolve => setTimeout(resolve, 200))
+        assert(doc.querySelector('#canvas canvas') === canvas && canvas.width > 0,
+            'Unchanged presentation must retain the completed visible canvas')
+        assert(doc.querySelector('.textLayer span') === text && selection.toString() === selected,
+            'Unchanged presentation must preserve the actual text selection')
+        assert(doc.querySelector('.annotationLayer a') === link,
+            'Unchanged presentation must retain the interactive annotation')
+        await apply(reader, { zoom: 'fit-width' })
+        assert(doc.querySelector('#canvas canvas') !== canvas,
+            'A real zoom change must still paint a new raster')
+        const zoomed = doc.querySelector('#canvas canvas')
+        reader.pageColors = { background: '#000000', foreground: '#ffffff' }
+        await apply(reader)
+        assert(doc.querySelector('#canvas canvas') !== zoomed,
+            'A real page-color change must still paint a new raster')
+    })
     await run('waits for current onZoom and overlayer before final location', async () => {
         let held
         const entered = deferred()
@@ -268,8 +410,8 @@ try {
         const target = reader.shadowRoot.querySelector('.scroll-page[data-index="1"]')
         assert(Math.abs(target.getBoundingClientRect().top - reader.getBoundingClientRect().top) < 1,
             'The destination must physically occupy the leading viewport edge')
-        assert(reader.getContents().some(item => item.index === 1 && item.doc.getElementById('passage')),
-            'The actual destination document must be loaded')
+        await waitFor(() => reader.getContents().some(item =>
+            item.index === 1 && item.doc.getElementById('passage')))
         reader.destroy()
         host.remove()
         const reopened = makeReader(sections, { index: location.index })
