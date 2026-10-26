@@ -18,6 +18,7 @@ const activeRenderTasks = new WeakMap()
 // Generation counter per document to detect stale renders after async gaps
 const renderGenerations = new WeakMap()
 const textLayers = new WeakMap()
+const completedRenders = new WeakMap()
 
 // Set up panning and selection event handlers once per iframe document
 const setupPanningEvents = (doc) => {
@@ -151,7 +152,20 @@ const render = async (page, doc, zoom, pageColors, prepareText, signal) => {
         activeRenderTasks.delete(doc)
     }
 
-    const scale = zoom * devicePixelRatio
+    const pixelRatio = devicePixelRatio
+    const scale = zoom * pixelRatio
+    const completed = completedRenders.get(doc)
+    if (completed?.page === page && completed.scale === scale
+        && completed.pixelRatio === pixelRatio
+        && completed.background === pageColors?.background
+        && completed.foreground === pageColors?.foreground
+        && completed.canvas === doc.querySelector('#canvas canvas')
+        && completed.canvas.width > 0 && completed.canvas.height > 0
+        && completed.annotations === doc.querySelector('.annotationLayer')) {
+        textLayers.get(doc)?.show()
+        return { status: 'rendered' }
+    }
+    completedRenders.delete(doc)
     doc.documentElement.style.transform = `scale(${1 / devicePixelRatio})`
     doc.documentElement.style.transformOrigin = 'top left'
     doc.documentElement.style.setProperty('--total-scale-factor', scale)
@@ -215,10 +229,28 @@ const render = async (page, doc, zoom, pageColors, prepareText, signal) => {
     let state = textLayers.get(doc)
     if (!state) {
         const controller = new AbortController()
-        state = { viewport, controller, layer: null, selection: null }
+        state = { viewport, controller, layer: null, selection: null, priority: null }
         textLayers.set(doc, state)
+        let prefetchTimer
+        const frame = doc.defaultView.frameElement
+        const visible = () => {
+            if (!frame?.isConnected || getComputedStyle(frame).visibility === 'hidden') return false
+            const bounds = frame.getBoundingClientRect()
+            const host = frame.getRootNode().host?.getBoundingClientRect()
+                ?? { top: 0, left: 0, bottom: innerHeight, right: innerWidth }
+            return bounds.bottom > Math.max(0, host.top)
+                && bounds.top < Math.min(innerHeight, host.bottom)
+                && bounds.right > Math.max(0, host.left)
+                && bounds.left < Math.min(innerWidth, host.right)
+        }
+        const observer = new IntersectionObserver(entries => {
+            if (entries.some(entry => entry.isIntersecting)) state.show()
+        })
+        if (frame) observer.observe(frame)
         doc.defaultView.addEventListener('pagehide', () => {
             controller.abort()
+            observer.disconnect()
+            clearTimeout(prefetchTimer)
             state.selection?.destroy()
         }, { once: true })
         const status = doc.createElement('div')
@@ -229,12 +261,18 @@ const render = async (page, doc, zoom, pageColors, prepareText, signal) => {
             top: `${12 * devicePixelRatio}px`, left: `${12 * devicePixelRatio}px`,
             padding: `${6 * devicePixelRatio}px`, borderRadius: `${4 * devicePixelRatio}px`,
             background: 'Canvas', color: 'CanvasText', font: `${14 * devicePixelRatio}px sans-serif` })
-        const start = async () => {
+        const start = async (priority = 'visible') => {
+            if (state.priority === 'visible' || state.priority === priority) return
+            state.priority = priority
             status.remove()
             container.setAttribute('aria-busy', 'true')
             try {
-                const model = await prepareText('visible', controller.signal)
-                if (controller.signal.aborted || !doc.defaultView) return
+                const model = await prepareText(priority, controller.signal)
+                if (controller.signal.aborted || !doc.defaultView || state.priority !== priority) return
+                if (state.layer) {
+                    container.removeAttribute('aria-busy')
+                    return
+                }
                 if (model.kind === 'recognized') {
                     state.layer = createRecognizedPDFTextLayer(container, model)
                 } else {
@@ -252,8 +290,9 @@ const render = async (page, doc, zoom, pageColors, prepareText, signal) => {
                 state.selection = setupPDFSelection(doc)
                 setupPanningEvents(doc)
                 doc.dispatchEvent(new CustomEvent('pdf-text-ready'))
-            } catch (error) {
-                if (controller.signal.aborted || !doc.defaultView) return
+            } catch {
+                if (controller.signal.aborted || !doc.defaultView || state.priority !== priority) return
+                state.priority = null
                 container.removeAttribute('aria-busy')
                 status.textContent = 'Text could not be prepared. '
                 const retry = doc.createElement('button')
@@ -264,7 +303,14 @@ const render = async (page, doc, zoom, pageColors, prepareText, signal) => {
                 doc.body.append(status)
             }
         }
-        void start()
+        state.show = () => {
+            if (visible()) {
+                clearTimeout(prefetchTimer)
+                void start('visible')
+            }
+        }
+        state.show()
+        if (!state.priority) prefetchTimer = setTimeout(() => void start('prefetch'), 200)
     } else {
         state.viewport = viewport
         state.layer?.update({ viewport })
@@ -299,6 +345,9 @@ const render = async (page, doc, zoom, pageColors, prepareText, signal) => {
     })
     if (!current()) return { status: 'cancelled' }
     previousAnnotations.replaceWith(div)
+    completedRenders.set(doc, { page, scale, pixelRatio,
+        background: pageColors?.background, foreground: pageColors?.foreground,
+        canvas, annotations: div })
     return { status: 'rendered' }
 }
 
@@ -427,6 +476,9 @@ export const makePDF = async file => {
     const pinnedPages = new Map()
     const pageMetadata = new Map()
     const lifetime = new AbortController()
+    let allowPrefetch
+    const visibleTextReady = new Promise(resolve => { allowPrefetch = resolve })
+    lifetime.signal.addEventListener('abort', allowPrefetch, { once: true })
     let recognitionSource
     book.configureTextRecognition = source => {
         if (recognitionSource === source) return
@@ -454,6 +506,7 @@ export const makePDF = async file => {
                         pinnedPages.delete(index)
                 }, { once: true })
             }
+            allowPrefetch()
         }
         return canonical
     }
@@ -465,6 +518,18 @@ export const makePDF = async file => {
         lifetime.signal.addEventListener('abort', abort, { once: true })
         if (callerSignal.aborted || lifetime.signal.aborted) abort()
         try {
+            // Keep the existing bounded lookahead, after the first visible page's
+            // text is ready. Search requests remain independent of this display gate.
+            if (priority === 'prefetch') await new Promise((resolve, reject) => {
+                const cancel = () => reject(signal.reason
+                    ?? new DOMException('Aborted', 'AbortError'))
+                signal.addEventListener('abort', cancel, { once: true })
+                visibleTextReady.then(() => {
+                    signal.removeEventListener('abort', cancel)
+                    resolve()
+                })
+                if (signal.aborted) cancel()
+            })
             checkAbortSignal(signal)
             const ready = pinnedPages.get(index)?.model ?? preparedPages.get(index)
             if (ready) return publishPreparedText(index, ready, priority, callerSignal)

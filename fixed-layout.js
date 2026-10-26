@@ -936,7 +936,15 @@ export class FixedLayout extends HTMLElement {
         const resized = this.#scrollViewport
             && (this.#scrollViewport.width !== this.clientWidth
                 || this.#scrollViewport.height !== this.clientHeight)
-        const target = this.#scrollTarget
+        let target = this.#scrollTarget
+        if (!target && this.#scrollViewport && (request || resized)) {
+            const position = resized ? this.#scrollPosition : this.scrollTop
+            const page = this.#scrollPages[this.#getScrollIndex(position)]
+            const bounds = page?.el.getBoundingClientRect()
+            if (bounds?.height) target = { page, offset:
+                (position - this.scrollTop + this.getBoundingClientRect().top
+                    + this.clientTop - bounds.top) / bounds.height }
+        }
         const currentIndex = target ? target.page.index : targetIndex >= 0 ? targetIndex
             : this.#getScrollIndex(resized ? this.#scrollPosition : this.scrollTop)
         for (const page of this.#scrollPages) {
