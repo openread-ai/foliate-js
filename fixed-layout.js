@@ -1065,8 +1065,11 @@ export class FixedLayout extends HTMLElement {
             { reason, range: null, index, fraction: 0, size: 1 } }))
     }
     #listenForPageGestures(doc) {
-        doc.addEventListener('wheel', e => this.handleWheel(e.deltaX, e.deltaY),
-            { passive: true })
+        doc.addEventListener('wheel', event => {
+            if (event.deltaY && !event.ctrlKey && !event.metaKey
+                && !event.shiftKey && !event.altKey) event.preventDefault()
+            this.handleWheel(event.deltaX, event.deltaY)
+        }, { passive: false })
         doc.addEventListener('touchstart', this.#onPageTouchStart, { passive: true })
         doc.addEventListener('touchmove', this.#onPageTouchMove, { passive: false })
         doc.addEventListener('touchend', this.#onPageTouchEnd)
